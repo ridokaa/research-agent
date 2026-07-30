@@ -22,7 +22,8 @@ Jangan lompat tahap — tiap prompt mengasumsikan hasil prompt sebelumnya sudah 
 | Output ke user | **Hanya jawaban akhir.** Tidak ada streaming proses berpikir |
 | Proses berpikir | Hanya masuk ke log/trace (file JSONL + tabel DB), bisa diakses via endpoint terpisah |
 | State | Riwayat percakapan + execution memory disimpan per iterasi loop |
-| Jalankan | Bisa disimulasikan penuh di lokal (termasuk mode mock tanpa API key) |
+| Jalankan | Bisa dijalankan penuh di lokal, memanggil layanan asli (LLM, Verosight, DB) — tanpa mock |
+| Error | Tidak ada mock/fallback di mana pun. Setiap kegagalan dilaporkan apa adanya: komponen mana, tahap mana, dan konteks agar bisa ditindak |
 
 ---
 
@@ -237,11 +238,64 @@ VEROSIGHT_API_KEY=vlt_live_xxx
 VEROSIGHT_MCP_SSE_URL=https://api.verosight.com/v1/mcp/sse
 VEROSIGHT_ENABLED=true
 VEROSIGHT_MODE=mcp          # rest | mcp | both
-
-# Simulasi
-MOCK_LLM=false             # true → loop diuji tanpa memanggil OpenAI (pakai skrip fixture)
-MOCK_TOOLS=false           # HANYA untuk tool builtin & MCP; Verosight REST selalu memanggil API asli
 ```
+
+> Tidak ada variabel `MOCK_LLM` / `MOCK_TOOLS` dan tidak ada mode mock apa pun.
+> Semua proses memanggil layanan asli. Lihat 1.6.
+
+### 1.6 Aturan global: TANPA mock + transparansi error
+
+Aturan ini berlaku untuk SETIAP prompt di bawah. Tidak perlu diulang di tiap
+prompt — cukup rujuk bagian ini.
+
+**1. Tanpa mock, tanpa fixture-sebagai-data, tanpa fallback palsu.**
+- Tidak ada mode mock aplikasi (`MOCK_LLM`, `MOCK_TOOLS`), tidak ada `app/llm/mock.py`,
+  tidak ada folder fixture yang dipakai sebagai pengganti respons asli.
+- LLM selalu memanggil OpenAI Responses API asli. Tool selalu memanggil layanan asli
+  (Verosight, DB). Tidak ada jalur kode yang mengembalikan data buatan saat layanan
+  gagal atau saat API key kosong.
+- "Fallback" yang tetap boleh ada hanyalah fallback ke **layanan nyata lain**
+  (mis. REST dipakai saat MCP server mati) atau fallback **algoritma** (mis.
+  pencarian keyword bila embedding kosong) — bukan fallback ke data palsu.
+- Jika API key belum diisi, proses TIDAK diam-diam beralih ke data tiruan; ia
+  gagal dengan pesan jelas bahwa key belum ada (lihat aturan 2).
+
+**2. Transparansi error — setiap kegagalan menyebut "apa" dan "di mana".**
+Definisikan satu bentuk laporan error dipakai seluruh komponen (LLM, tool executor,
+MCP, DB, Verosight, API layer):
+
+```python
+class ErrorReport(BaseModel):
+    component: Literal["llm", "tool_executor", "mcp", "db", "verosight", "api"]
+    stage: str          # tahap spesifik, mis. "auth_token", "http_request",
+                        # "response_parse", "schema_validation", "connection"
+    message: str        # penjelasan manusiawi: apa yang gagal & saran cek apa
+    http_status: int | None = None
+    provider_code: str | None = None   # kode error dari layanan (mis. Verosight)
+    request_id: str | None = None
+    endpoint: str | None = None
+    retryable: bool = False
+```
+
+- Semua kegagalan di dalam tool dikembalikan sebagai `ToolResult(status="error")`
+  yang memuat `ErrorReport` — BUKAN exception yang menghentikan run. Loop memakai
+  error itu sebagai input iterasi berikutnya.
+- Kegagalan di luar loop (mis. LLM tak bisa dihubungi sama sekali, DB down)
+  menghentikan run dengan `status="failed"` dan menuliskan `ErrorReport` lengkap
+  ke trace + response API — user melihat pesan yang menyebut komponen & tahap,
+  bukan stack trace mentah.
+- `ErrorReport` selalu masuk ke trace (`type="error"`) dan ke log JSONL.
+  Rahasia (api_key/token) tetap diredaksi.
+
+**3. Testing tanpa mock.**
+- Uji **logika murni** (validasi schema, urutan trace, redaksi, dedup, stop
+  condition, kompaksi konteks) secara langsung tanpa menyentuh layanan eksternal —
+  ini tidak butuh mock karena tidak ada I/O.
+- Uji **jalur nyata** sebagai test "live": tandai dengan marker pytest `live`
+  supaya bisa di-skip di CI saat key tidak tersedia. Untuk memverifikasi laporan
+  error, picu error ASLI (key sengaja salah → 401 asli; argumen salah → 400 asli;
+  budget kecil → 402 asli) lalu assert `ErrorReport.stage` benar.
+- Tidak memakai `respx` atau library HTTP-mock untuk mensimulasikan respons.
 
 ---
 
@@ -256,7 +310,8 @@ Requirement:
 - Python 3.11+, dependency manager: uv (fallback: pip + pyproject.toml)
 - Dependencies: fastapi, uvicorn[standard], pydantic>=2, pydantic-settings,
   sqlalchemy[asyncio]>=2, asyncpg, alembic, httpx, structlog, tenacity,
-  python-dotenv, orjson, rich, typer. Dev: pytest, pytest-asyncio, respx, ruff, mypy.
+  python-dotenv, orjson, rich, typer. Dev: pytest, pytest-asyncio, ruff, mypy.
+  (Tanpa respx / library HTTP-mock — lihat aturan global 1.6.)
 - Buat struktur folder persis seperti ini: [tempel bagian 1.2 dari plan]
 - app/config.py: Settings berbasis pydantic-settings, baca .env, semua variabel
   di [tempel bagian 1.5]. Beri default aman + validasi (mis. DATABASE_URL wajib
@@ -387,18 +442,28 @@ Requirement:
 - Setiap panggilan memancarkan trace event llm_request & llm_response lewat
   RunTracer yang di-inject (opsional, boleh None). Simpan response_id di trace
   supaya rantai previous_response_id bisa ditelusuri.
-- Mode MOCK_LLM=true: pakai app/llm/mock.py yang membaca skenario dari
-  tests/fixtures/llm_scripts/*.json (tiap langkah = output_text atau function_calls),
-  sehingga loop bisa diuji tanpa API key.
+- TANPA mode mock (lihat aturan global 1.6). Tidak ada app/llm/mock.py, tidak ada
+  fixture skrip. Client selalu memanggil Responses API asli.
+- Laporan error (aturan 1.6): bila panggilan gagal, kembalikan/raise dengan
+  ErrorReport(component="llm", stage=...) yang menyebut tahap: "missing_api_key"
+  (key kosong → gagal eksplisit, JANGAN diam), "auth" (401), "rate_limited" (429),
+  "http_request" (koneksi/timeout), "response_parse" (2xx tapi struktur output tak
+  terduga), "server_error" (5xx). Sertakan http_status dan response id bila ada.
 - Guard konteks: bila store=false (tidak pakai previous_response_id), sediakan
   compact_input() yang meringkas item lama (sisakan instruksi + N item terakhir
   + ringkasan). Sediakan hook-nya sekarang; implementasi boleh sederhana.
 
-Definition of Done: test dengan respx memverifikasi (a) parsing item function_call
-dari response.output, (b) definisi tool ter-serialisasi FLAT (tidak ada key
-"function" bersarang), (c) function_call_output terbentuk benar untuk iterasi
-lanjutan, (d) retry pada 429 & tidak retry pada 401, (e) mock mode menghasilkan
-urutan respon sesuai skrip.
+Definition of Done (tanpa mock — lihat 1.6):
+- Test logika murni (tanpa jaringan): (a) definisi tool ter-serialisasi FLAT
+  (tidak ada key "function" bersarang), (b) fungsi yang membentuk
+  function_call_output dari hasil tool menghasilkan struktur benar, (c) parser
+  response.output memetakan item function_call & output_text dengan benar bila
+  diberi objek response contoh yang dibangun langsung dalam test (bukan HTTP-mock).
+- Test live (marker `live`, butuh LLM_API_KEY asli): satu panggilan nyata
+  mengembalikan LLMResponse ter-parse; panggilan dengan key sengaja salah
+  menghasilkan ErrorReport(stage="auth"); key kosong → ErrorReport(stage=
+  "missing_api_key"). Retry 429 diverifikasi lewat konfigurasi tenacity (unit,
+  tanpa memalsukan respons).
 ```
 
 ---
@@ -461,11 +526,12 @@ memverifikasi schema-nya benar, argumen invalid menghasilkan ToolResult error
 ```text
 Implementasikan integrasi Verosight lewat REST API sebagai tool lokal.
 
-PENTING — dua aturan tegas untuk tahap ini:
-- TANPA mock dan TANPA fallback. Tool Verosight SELALU memanggil API asli
-  (https://api.verosight.com). Abaikan flag MOCK_TOOLS untuk tool-tool ini.
-- Jika terjadi error, JANGAN menyembunyikannya. Laporkan dengan jelas bagian
-  MANA yang gagal (lihat poin 4).
+PENTING — patuhi aturan global 1.6 (tanpa mock + transparansi error):
+- TANPA mock dan TANPA fallback ke data palsu. Tool Verosight SELALU memanggil
+  API asli (https://api.verosight.com). Bila API key kosong → gagal eksplisit,
+  bukan diam-diam mengembalikan data tiruan.
+- Jika terjadi error, JANGAN menyembunyikannya. Laporkan dengan ErrorReport
+  (component="verosight") yang menyebut jelas bagian MANA yang gagal (poin 4).
 
 Referensi API (base: https://api.verosight.com):
 - Auth: header `X-API-Key: vlt_live_...`, atau tukar ke JWT via
@@ -500,9 +566,10 @@ Referensi API (base: https://api.verosight.com):
    batasi sample_* jadi maks 5 item, pertahankan angka agregat. Simpan respons
    penuh ke tool_invocations.result.
 
-4. Pelaporan error yang eksplisit — inti dari tahap ini. Tambahkan field
-   error_stage pada ToolResult (atau di dalam error message) yang menyebutkan
-   persis di tahap mana kegagalan terjadi:
+4. Pelaporan error yang eksplisit — inti dari tahap ini. Isi ErrorReport
+   (component="verosight", lihat 1.6) dengan `stage` yang menyebutkan persis
+   di tahap mana kegagalan terjadi:
+     - "missing_api_key"   → VEROSIGHT_API_KEY kosong (gagal eksplisit, bukan mock)
      - "auth_token"        → gagal menukar API key jadi JWT / API key invalid (401)
      - "http_request"      → koneksi/timeout/DNS ke api.verosight.com gagal
      - "rate_limited"      → 429 (sertakan detik reset)
@@ -517,10 +584,15 @@ Referensi API (base: https://api.verosight.com):
    Semua ini dikembalikan sebagai ToolResult(status="error"), BUKAN exception yang
    menghentikan run.
 
-Definition of Done: test respx untuk sukses, 401, 402, 429, 5xx, dan envelope
-rusak — masing-masing menghasilkan error_stage yang benar. Verifikasi credits_used
-terakumulasi ke AgentState. Tidak ada jalur kode yang membaca fixture sebagai
-pengganti panggilan nyata (respx di sini hanya alat test, bukan mode mock aplikasi).
+Definition of Done (tanpa mock — lihat 1.6):
+- Test live (marker `live`, butuh VEROSIGHT_API_KEY asli): satu tool sukses
+  mengembalikan data + credits_used terakumulasi ke AgentState; key sengaja salah
+  → stage="auth_token"; key kosong → stage="missing_api_key"; argumen tak lolos
+  schema → stage="validation" (tanpa request ke jaringan).
+- Test logika murni: fungsi peringkas respons memotong sample_* jadi ≤5 dan
+  membuang media_urls kosong bila diberi contoh envelope; parser envelope rusak
+  menghasilkan stage="envelope_parse". Tidak ada HTTP-mock; contoh envelope
+  dibangun langsung sebagai objek dalam test.
 ```
 
 ---
@@ -653,11 +725,18 @@ Aturan penting:
 - Loop harus tahan terhadap tool yang gagal: kegagalan tool adalah input untuk
   iterasi berikutnya, bukan penghentian run.
 
-Definition of Done: test end-to-end dengan MOCK_LLM + MOCK_TOOLS untuk skenario:
-(a) jawaban langsung tanpa tool, (b) 1 tool lalu jawab, (c) 3 tool berantai,
-(d) tool selalu gagal → agen tetap menjawab dengan disclaimer,
-(e) max_iterations tercapai → status exhausted tapi answer tetap ada,
-(f) LLM mengulang tool call identik → terdeteksi cache/no-progress.
+Definition of Done (tanpa mock — lihat 1.6):
+- Test logika murni pada policy & state (tanpa LLM/jaringan): (d) saat sebuah
+  ToolResult(status="error") disuntikkan ke state, loop tetap lanjut & finalisasi
+  dengan disclaimer; (e) max_iterations tercapai → status exhausted, answer tetap
+  ada; (f) dua tool call identik berurutan → terdeteksi cache/no-progress. Skenario
+  ini menguji orkestrasi dengan tool lokal deterministik (mis. calculator/clock),
+  bukan LLM tiruan.
+- Test live end-to-end (marker `live`, butuh LLM_API_KEY asli): (a) pertanyaan yang
+  bisa dijawab tanpa tool → 1 iterasi; (b) pertanyaan yang memicu 1 tool lalu
+  jawab; (c) pertanyaan yang memerlukan beberapa tool berantai. Verifikasi run
+  berstatus success dan answer tidak kosong. Bila LLM tak bisa dihubungi → run
+  status="failed" dengan ErrorReport(component="llm") yang jelas.
 ```
 
 ---
@@ -713,7 +792,8 @@ Buat alat untuk memantau cara berpikir agen di setiap langkah.
    - `simulate replay <run_id>` → ambil trace dari DB dan render ulang.
    - `simulate scenarios` → jalankan semua skenario di scripts/seed_scenarios.py
      dan cetak tabel ringkasan: skenario | status | iterasi | tools | credits | latensi.
-   - Flag: --mock (paksa MOCK_LLM & MOCK_TOOLS), --max-iter, --json.
+   - Flag: --max-iter, --json, --live-only (jalankan hanya skenario bertanda live).
+     Tidak ada flag --mock: simulate SELALU memakai LLM & tool asli (lihat 1.6).
 
 2. Halaman debug HTML sederhana di GET /debug/runs/{run_id} (hanya aktif jika
    APP_ENV=local): timeline vertikal, tiap langkah bisa di-expand untuk melihat
@@ -721,8 +801,10 @@ Buat alat untuk memantau cara berpikir agen di setiap langkah.
 
 3. Pastikan file log JSONL bisa di-tail: `tail -f logs/agent.jsonl | jq`.
 
-Definition of Done: `python scripts/simulate.py ask "sentimen publik soal X"
---mock` menghasilkan trace pohon yang terbaca dan diakhiri jawaban final.
+Definition of Done: `python scripts/simulate.py ask "sentimen publik soal X"`
+(dengan LLM_API_KEY & VEROSIGHT_API_KEY terisi) menghasilkan trace pohon yang
+terbaca dan diakhiri jawaban final. Bila sebuah tool gagal, langkah tool_result
+di trace menampilkan ErrorReport (komponen + stage), bukan crash.
 ```
 
 ---
@@ -753,12 +835,13 @@ merepresentasikan pemakaian nyata:
 Setiap skenario punya assertion: status akhir, jumlah iterasi maksimum,
 tool yang dipanggil, dan bahwa answer tidak kosong.
 
-Catatan mode: skenario 1, 4, 5, 6 menguji LOGIKA LOOP dan bisa lulus penuh dengan
---mock (MOCK_LLM + tool builtin/MCP mock) tanpa jaringan. Skenario 2, 3, 7 menyentuh
-Verosight REST yang tidak punya mock (lihat PROMPT 5), jadi butuh VEROSIGHT_API_KEY
-asli dan akan memakai kredit — tandai skenario ini agar bisa di-skip di CI
-(mis. marker pytest "live"). Kegagalan jaringan pada skenario live harus muncul
-sebagai error_stage yang informatif, bukan crash.
+Catatan mode (tanpa mock — lihat 1.6): SEMUA skenario memakai LLM asli dan tool
+asli; tidak ada varian mock. Skenario yang menyentuh Verosight/LLM ditandai marker
+pytest `live` agar bisa di-skip di CI saat key tidak tersedia (skip, BUKAN diganti
+data palsu). Skenario 4 & 5 memicu kondisi kosong/error dengan input nyata
+(keyword tanpa data → empty asli; budget/kunci yang memicu 402/429 asli). Setiap
+kegagalan muncul sebagai ErrorReport (komponen + stage) yang informatif, bukan crash,
+dan setiap skenario tetap meng-assert answer tidak kosong.
 ```
 
 ---
@@ -891,8 +974,10 @@ yang belum terjawab, atau data yang ada bertentangan.
 - [ ] Tool gagal / kosong / 429 / 402 → agen tetap menghasilkan jawaban
 - [ ] `max_iterations` tercapai → status `exhausted`, jawaban tetap ada
 - [ ] API key tidak muncul di log, trace, maupun response
-- [ ] `python scripts/simulate.py scenarios --mock` → skenario logika loop (1,4,5,6) lulus tanpa jaringan
-- [ ] Skenario Verosight (2,3,7) → jalan dengan API key asli; error apa pun muncul dengan `error_stage` jelas
+- [ ] Tidak ada mode mock / fixture-sebagai-data / fallback palsu di seluruh kode (grep `MOCK_`, `mock` → bersih)
+- [ ] `python scripts/simulate.py scenarios` (dengan key terisi) → semua skenario live jalan pakai LLM & tool asli
+- [ ] Setiap error (LLM/Verosight/MCP/DB) muncul sebagai `ErrorReport` dengan `component` + `stage` di trace & response
+- [ ] API key kosong → proses gagal eksplisit dengan pesan jelas, BUKAN diam-diam memakai data tiruan
 - [ ] Client LLM memakai Responses API: tool ter-serialisasi flat, `previous_response_id` terpakai antar-iterasi
 
 ---
@@ -906,11 +991,13 @@ kredit, dan jadi fallback saat MCP server tidak tersedia. Mode `both` sebaiknya
 hanya dipakai untuk perbandingan, karena tool duplikat cenderung membingungkan LLM.
 
 **Hemat kredit saat development.** Setiap panggilan Verosight menghabiskan kredit
-(2–20 per call, akun gratis 1.000 kredit). Tool Verosight REST (PROMPT 5) sengaja
-TIDAK punya mock — jadi kembangkan logika loop dengan `MOCK_LLM=true` (tidak
-menyentuh Verosight sama sekali), dan barulah uji jalur Verosight dengan API asli
-saat memang perlu. Karena tidak ada fallback, tiap error Verosight muncul apa adanya
-lewat `error_stage` — inilah yang dipakai untuk tahu bagian mana yang gagal
+(2–20 per call, akun gratis 1.000 kredit). Karena tidak ada mock (aturan 1.6),
+hemat kredit lewat cara nyata: kembangkan & uji sebagian besar logika sebagai
+test murni yang tidak melakukan I/O (validasi schema, policy, state, trace) — ini
+tidak menyentuh Verosight sama sekali; set `credits_budget` kecil saat mencoba
+jalur Verosight; dan pisahkan test `live` agar hanya dijalankan saat perlu. Karena
+tidak ada fallback palsu, tiap error muncul apa adanya lewat `ErrorReport`
+(component + stage) — inilah yang dipakai untuk tahu bagian mana yang gagal
 (auth, request, kredit, rate limit, atau parsing envelope).
 
 **Penyebab loop tak berujung yang paling sering** — tangani sejak PROMPT 8:
