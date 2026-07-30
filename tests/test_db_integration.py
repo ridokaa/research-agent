@@ -43,11 +43,10 @@ async def session() -> AsyncSession:  # type: ignore[override]
         await conn.run_sync(Base.metadata.create_all)
 
     factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
-    async with factory() as session:
-        async with session.begin():
-            yield session
-            # Roll back so tests are isolated — nothing is permanently committed
-            await session.rollback()
+    async with factory() as session, session.begin():
+        yield session
+        # Roll back so tests are isolated — nothing is permanently committed
+        await session.rollback()
 
     await engine.dispose()
 
@@ -209,13 +208,11 @@ async def test_execution_memory_by_iteration(session: AsyncSession) -> None:
 @pytest.mark.asyncio
 async def test_cascade_delete_run(session: AsyncSession) -> None:
     """Deleting a run cascades to run_steps, tool_invocations, execution_memory."""
-    from sqlalchemy import select, delete
 
     conv_repo = ConversationRepo(session)
     run_repo = RunRepo(session)
     step_repo = StepRepo(session)
     mem_repo = MemoryRepo(session)
-    from app.db.models import RunStep, ExecutionMemory
 
     conv = await conv_repo.create(title="Cascade test")
     run = await run_repo.create(conversation_id=conv.id, user_query="Cascade test")

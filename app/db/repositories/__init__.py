@@ -9,10 +9,13 @@ from app.db.repositories.conversation import ConversationRepo
 from app.db.repositories.memory import MemoryRepo
 from app.db.repositories.run import RunRepo
 from app.db.repositories.step import StepRepo
+from app.db.repositories.tool_invocation import ToolInvocationRepo
 
 __all__ = [
     "ConversationRepo",
     "MemoryRepo",
     "RunRepo",
     "StepRepo",
+    "ToolInvocationRepo",
 ]
+

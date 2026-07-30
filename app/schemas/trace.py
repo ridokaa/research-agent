@@ -11,7 +11,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-
 # All valid event types in the order they typically appear during a run.
 TraceEventType = Literal[
     "run_start",
@@ -22,6 +21,7 @@ TraceEventType = Literal[
     "tool_selected",
     "tool_call",
     "tool_result",
+    "tool_call_cached",
     "memory_write",
     "reflection",
     "final_answer",

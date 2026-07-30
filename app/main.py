@@ -107,14 +107,26 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Middleware registration (Order: RequestID -> RateLimit -> Duration Logging -> CORS)
+    from app.api.middleware import logging_middleware, rate_limit_middleware, request_id_middleware
+
+    app.middleware("http")(logging_middleware)
+    app.middleware("http")(rate_limit_middleware)
+    app.middleware("http")(request_id_middleware)
+
     # CORS (allow localhost for local development)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://localhost:8080"],
+        allow_origins=["http://localhost:3000", "http://localhost:8080", "http://127.0.0.1:3000", "http://127.0.0.1:8080"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Register global exception handlers
+    from app.api.exceptions import register_exception_handlers
+
+    register_exception_handlers(app)
 
     # Include routes
     _register_routes(app)
@@ -124,9 +136,19 @@ def create_app() -> FastAPI:
 
 def _register_routes(app: FastAPI) -> None:
     """Register all API routers."""
+    from app.api.routes.agent import router as agent_router
+    from app.api.routes.conversations import router as conversations_router
     from app.api.routes.health import router as health_router
+    from app.api.routes.metrics import router as metrics_router
+    from app.api.routes.runs import router as runs_router
+    from app.api.routes.tools import router as tools_router
 
+    app.include_router(agent_router)
+    app.include_router(runs_router)
+    app.include_router(conversations_router)
+    app.include_router(tools_router)
     app.include_router(health_router)
+    app.include_router(metrics_router)
 
 
 # Module-level app instance (used by uvicorn)

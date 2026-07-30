@@ -29,10 +29,11 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any
 from uuid import UUID
 
 import structlog
@@ -75,18 +76,26 @@ _REDACT_PATTERN = re.compile(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _redact(obj: Any, _depth: int = 0) -> Any:
-    """Recursively redact sensitive values in a nested dict/list structure.
+_SECRET_VALUE_PATTERNS = [
+    re.compile(r"sk-[a-zA-Z0-9_\-]+"),
+    re.compile(r"vlt_[a-zA-Z0-9_\-]+"),
+    re.compile(r"(Bearer\s+)[a-zA-Z0-9_\-\.]+"),
+]
 
-    Only string values whose **key** matches a sensitive name are replaced;
-    non-string values are left as-is (e.g. numeric API IDs).
-    """
+
+def _redact(obj: Any, _depth: int = 0) -> Any:
+    """Recursively redact sensitive keys and values in a nested structure."""
     if _depth > 10:
         return obj  # safety: prevent infinite recursion on deeply nested data
+    if isinstance(obj, str):
+        val = obj
+        for pat in _SECRET_VALUE_PATTERNS:
+            val = pat.sub("[REDACTED]", val)
+        return val
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
         for k, v in obj.items():
-            if isinstance(k, str) and _REDACT_PATTERN.fullmatch(k.lower()):
+            if isinstance(k, str) and (_REDACT_PATTERN.fullmatch(k.lower()) or "key" in k.lower() or "secret" in k.lower() or "token" in k.lower()):
                 out[k] = "***"
             else:
                 out[k] = _redact(v, _depth + 1)
@@ -242,19 +251,21 @@ class RunTracer:
             summary=summary,
             payload=stored_payload,
             duration_ms=duration_ms,
-            created_at=datetime.now(tz=timezone.utc),
+            created_at=datetime.now(tz=UTC),
         )
 
         self._buffer.append(evt)
 
         # Emit to structlog immediately — this goes to console / JSON file.
+        reserved_keys = {"_truncated", "_original_bytes", "iteration", "seq", "event_type", "duration_ms"}
+        extra_payload = {k: v for k, v in stored_payload.items() if k not in reserved_keys}
         self._logger.info(
             summary,
             event_type=type,
             seq=seq,
             iteration=iter_,
             duration_ms=duration_ms,
-            **{k: v for k, v in stored_payload.items() if k not in ("_truncated", "_original_bytes")},
+            **extra_payload,
         )
 
         return evt

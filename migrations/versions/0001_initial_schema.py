@@ -20,7 +20,7 @@ Indexes:
 """
 from __future__ import annotations
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
@@ -28,9 +28,9 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "0001"
-down_revision: Union[str, None] = None
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
@@ -107,6 +107,7 @@ def upgrade() -> None:
         sa.Column("credits_used", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("total_tokens", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("latency_ms", sa.BigInteger(), nullable=True),
+        sa.Column("last_response_id", sa.String(256), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
         sa.Column(
             "started_at",

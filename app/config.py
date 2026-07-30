@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     LOG_FORMAT: Literal["console", "json"] = "console"
     LOG_FILE: str = "./logs/agent.jsonl"
+    MAX_QUERY_LENGTH: int = Field(default=4000, ge=1)
+    RATE_LIMIT_PER_MINUTE: int = Field(default=60, ge=1)
 
     # ---------------------------------------------------------------------------
     # Database
@@ -68,6 +70,19 @@ class Settings(BaseSettings):
     AGENT_RUN_TIMEOUT_S: float = Field(default=180.0, gt=0)
     AGENT_CREDITS_BUDGET: int = Field(default=100, ge=0)
     AGENT_PARALLEL_TOOLS: bool = True
+    TOOLS_DISABLED: list[str] = Field(default_factory=list)
+
+    @field_validator("TOOLS_DISABLED", mode="before")
+    @classmethod
+    def parse_tools_disabled(cls, v: object) -> list[str]:
+        if isinstance(v, str):
+            if not v.strip():
+                return []
+            return [x.strip() for x in v.split(",") if x.strip()]
+        if isinstance(v, (list, tuple, set)):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return v
+
 
     # ---------------------------------------------------------------------------
     # Verosight
@@ -77,9 +92,10 @@ class Settings(BaseSettings):
     VEROSIGHT_MCP_SSE_URL: str = "https://api.verosight.com/v1/mcp/sse"
     VEROSIGHT_ENABLED: bool = True
     VEROSIGHT_MODE: Literal["rest", "mcp", "both"] = "mcp"
+    MCP_SERVERS_JSON: str = ""
 
     @model_validator(mode="after")
-    def validate_no_placeholder_secrets(self) -> "Settings":
+    def validate_no_placeholder_secrets(self) -> Settings:
         """Reject placeholder secrets in non-local environments.
 
         In local mode the placeholders are accepted so the server can start

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -52,9 +51,31 @@ def clear_run_context() -> None:
     clear_contextvars()
 
 
-# ---------------------------------------------------------------------------
-# Custom processors
-# ---------------------------------------------------------------------------
+import re
+
+_SECRET_PATTERNS = [
+    re.compile(r"sk-[a-zA-Z0-9_\-]+"),
+    re.compile(r"vlt_[a-zA-Z0-9_\-]+"),
+    re.compile(r"(Bearer\s+)[a-zA-Z0-9_\-\.]+"),
+]
+
+
+def _sanitize_value(val: Any) -> Any:
+    if isinstance(val, str):
+        for pattern in _SECRET_PATTERNS:
+            val = pattern.sub("[REDACTED]", val)
+        return val
+    elif isinstance(val, dict):
+        return {k: _sanitize_value(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [_sanitize_value(x) for x in val]
+    return val
+
+
+def _sanitize_secrets(logger: WrappedLogger, method: str, event_dict: EventDict) -> EventDict:  # noqa: ARG001
+    """Sanitize API keys and secret patterns from log dictionaries."""
+    return _sanitize_value(event_dict)
+
 
 def _drop_color_message(logger: WrappedLogger, method: str, event_dict: EventDict) -> EventDict:  # noqa: ARG001
     """Remove rich's internal ``color_message`` key before serialisation."""
@@ -133,6 +154,7 @@ def configure_logging(
         structlog.processors.StackInfoRenderer(),
         _drop_color_message,
         _add_app_name,
+        _sanitize_secrets,
     ]
 
     # --- JSON mode ----------------------------------------------------------

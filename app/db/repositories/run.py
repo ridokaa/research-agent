@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,10 +27,11 @@ class RunRepo:
         conversation_id: uuid.UUID,
         user_query: str,
         status: str = "running",
+        run_id: uuid.UUID | None = None,
     ) -> Run:
         """Insert a new run and return the persisted object."""
         run = Run(
-            id=uuid.uuid4(),
+            id=run_id or uuid.uuid4(),
             conversation_id=conversation_id,
             user_query=user_query,
             status=status,
@@ -50,6 +50,7 @@ class RunRepo:
         credits_used: int | None = None,
         total_tokens: int | None = None,
         latency_ms: int | None = None,
+        last_response_id: str | None = None,
         error: str | None = None,
         finished_at: datetime | None = None,
     ) -> Run | None:
@@ -68,9 +69,11 @@ class RunRepo:
             run.total_tokens = total_tokens
         if latency_ms is not None:
             run.latency_ms = latency_ms
+        if last_response_id is not None:
+            run.last_response_id = last_response_id
         if error is not None:
             run.error = error
-        run.finished_at = finished_at or datetime.now(tz=timezone.utc)
+        run.finished_at = finished_at or datetime.now(tz=UTC)
         await self._session.flush()
         return run
 

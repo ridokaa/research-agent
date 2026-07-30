@@ -68,9 +68,7 @@ def _is_retryable(exc: BaseException) -> bool:
     """Decide whether *exc* should trigger a retry."""
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in _RETRYABLE_STATUS
-    if isinstance(exc, _RETRYABLE_EXCEPTIONS):
-        return True
-    return False
+    return isinstance(exc, _RETRYABLE_EXCEPTIONS)
 
 
 def _build_retry_decorator() -> Any:
@@ -149,7 +147,7 @@ class LLMClient:
         """Close the underlying HTTP client."""
         await self._http.aclose()
 
-    async def __aenter__(self) -> "LLMClient":
+    async def __aenter__(self) -> LLMClient:
         return self
 
     async def __aexit__(self, *_: Any) -> None:
@@ -334,6 +332,12 @@ class LLMClient:
         # ------------------------------------------------------------------
         try:
             response = LLMResponse.from_raw(raw)
+            try:
+                from app.observability.metrics import LLM_TOKENS_TOTAL
+
+                LLM_TOKENS_TOTAL.inc(response.usage.total_tokens)
+            except Exception:
+                pass
         except Exception as exc:  # noqa: BLE001
             report = ErrorReport(
                 component="llm",

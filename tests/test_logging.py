@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,7 +22,6 @@ import pytest
 from app.logging.formatters import render_trace, render_trace_coloured
 from app.logging.tracer import RunTracer, _redact, _truncate_payload
 from app.schemas.trace import TraceEvent
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -75,7 +74,7 @@ def make_trace_event(
         summary=summary,
         payload=payload or {},
         duration_ms=duration_ms,
-        created_at=datetime.now(tz=timezone.utc),
+        created_at=datetime.now(tz=UTC),
     )
 
 
@@ -347,7 +346,7 @@ class TestStepContextManager:
 class TestRenderTrace:
     def _make_events(self) -> list[TraceEvent]:
         run_id = uuid.UUID("3f2a0000-0000-0000-0000-000000000000")
-        base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        base = datetime(2024, 1, 1, tzinfo=UTC)
         events = [
             TraceEvent(run_id=run_id, seq=0, iteration=1, type="llm_request",
                        summary="LLM call", payload={"model": "gpt-4o-mini", "tools": 22, "tokens_in": 812},
@@ -432,7 +431,7 @@ class TestRenderTrace:
         events = [TraceEvent(
             run_id=run_id, seq=0, iteration=0, type="run_start",
             summary="start", payload={}, duration_ms=None,
-            created_at=datetime.now(tz=timezone.utc),
+            created_at=datetime.now(tz=UTC),
         )]
         lines = render_trace(events).split("\n")
         assert lines[1].startswith("└─")
@@ -452,12 +451,12 @@ class TestTraceEventSchema:
             summary="test",
             payload={},
             duration_ms=None,
-            created_at=datetime.now(tz=timezone.utc),
+            created_at=datetime.now(tz=UTC),
         )
         assert evt.seq == 0
 
     def test_invalid_type_raises(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             TraceEvent(
                 run_id=uuid.uuid4(),
                 seq=0,
@@ -466,7 +465,7 @@ class TestTraceEventSchema:
                 summary="test",
                 payload={},
                 duration_ms=None,
-                created_at=datetime.now(tz=timezone.utc),
+                created_at=datetime.now(tz=UTC),
             )
 
     def test_all_valid_types_accepted(self) -> None:
@@ -484,6 +483,6 @@ class TestTraceEventSchema:
                 summary="test",
                 payload={},
                 duration_ms=None,
-                created_at=datetime.now(tz=timezone.utc),
+                created_at=datetime.now(tz=UTC),
             )
             assert evt.type == t

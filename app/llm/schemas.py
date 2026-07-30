@@ -10,7 +10,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # Tool definition (FLAT — no nested "function" key)
 # ---------------------------------------------------------------------------
@@ -92,7 +91,7 @@ class UsageInfo:
         return self.input_tokens + self.output_tokens
 
     @classmethod
-    def from_raw(cls, raw: dict[str, Any] | None) -> "UsageInfo":
+    def from_raw(cls, raw: dict[str, Any] | None) -> UsageInfo:
         if raw is None:
             return cls()
         return cls(
@@ -110,7 +109,7 @@ class FunctionCall:
     arguments_dict: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_output_item(cls, item: dict[str, Any]) -> "FunctionCall":
+    def from_output_item(cls, item: dict[str, Any]) -> FunctionCall:
         """Parse a function_call output item from response.output."""
         raw_args = item.get("arguments", "{}")
         try:
@@ -146,7 +145,7 @@ class LLMResponse:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_raw(cls, raw: dict[str, Any]) -> "LLMResponse":
+    def from_raw(cls, raw: dict[str, Any]) -> LLMResponse:
         """Parse a full Responses API JSON response body."""
         response_id = raw.get("id", "")
         status = raw.get("status", "completed")
@@ -162,9 +161,7 @@ class LLMResponse:
             if item_type == "message":
                 # Extract text from content array
                 for content_block in item.get("content", []):
-                    if content_block.get("type") == "output_text":
-                        output_texts.append(content_block.get("text", ""))
-                    elif content_block.get("type") == "text":
+                    if content_block.get("type") == "output_text" or content_block.get("type") == "text":
                         output_texts.append(content_block.get("text", ""))
 
             elif item_type == "function_call":

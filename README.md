@@ -1,181 +1,197 @@
 # Agentic Loop
 
-> A research agent that thinks, executes tools in a loop, and stops when it has a verified final answer. Built with FastAPI + SQLAlchemy (async) + PostgreSQL.
+> Agentic Loop adalah sistem agen riset otonom yang bekerja dalam iterasi (reason-act loop), mengeksekusi berbagai perkakas (*tools*), dan berhenti secara independen ketika telah memperoleh serta memverifikasi jawaban final.
 
 ---
 
-## Architecture
+## 1. Arsitektur Sistem
 
-```
-User request
+Berikut adalah alur eksekusi komponen dari request pengguna hingga pengembalian jawaban final (sesuai bagian 1.1 PROMPT_PLAN.md):
+
+```text
+Pengguna (Query)
     │
     ▼
-POST /v1/agent/query ──► create Run (status=running)
+[FastAPI Application] ──► Validasi query & rate limit per IP
     │
     ▼
-┌───────────────────── AGENT LOOP (max N iterations) ─────────────────────┐
-│  1. Build context = system prompt + conversation history                │
-│                     + execution memory (prior tool results)             │
-│  2. Call LLM with tool schema list (local + MCP)                        │
-│  3. LLM responds:                                                        │
-│       ├─ has tool_calls  → execute in parallel → store in memory        │
-│       └─ no tool_calls   → self-check for "is_final?"                   │
-│              ├─ yes  → exit loop, status=success                         │
-│              └─ no   → inject reflection prompt, continue               │
-│  4. Stop: final answer | max_iterations | budget | timeout | error      │
-└──────────────────────────────────────────────────────────────────────────┘
+[AgentLoop] ──► Inisialisasi State, Tracer, & Repository DB
+    │
+    ├────────────────────── AGENTIC LOOP ──────────────────────┐
+    │                                                          │
+    │  1. Planner.build_request()                              │
+    │     Membangun system prompt + riwayat + memory item      │
+    │                                                          │
+    │  2. LLMClient.respond() (Responses API)                  │
+    │     Mengirim payload ke OpenAI / LLM Provider            │
+    │                                                          │
+    │  3. Handle Response                                      │
+    │     ├─ function_calls ──► ToolExecutor.execute_tools()  │
+    │     │                     ├─ Dedup & Cache check         │
+    │     │                     ├─ Parallel execution          │
+    │     │                     └─ Truncate & Save memory      │
+    │     │
+    │     └─ text response  ──► Reflection & Finalize Self-Check
+    │                           ├─ is_final = True  ──► STOP   │
+    │                           └─ is_final = False ──► REPEAT │
+    │                                                          │
+    │  4. Evaluasi Policy (Max Iterations / Credits / Timeout) │
+    └──────────────────────────────────────────────────────────┘
     │
     ▼
-Response: { "answer": "...", "run_id": "..." }   ← answer only
-Trace:    GET /v1/runs/{run_id}/trace             ← full reasoning
+[RunResult] ──► HANYA mengembalikan answer + metadata run
+                 (Detail trace & thinking dapat diakses via GET /v1/runs/{id}/trace)
 ```
 
 ---
 
-## Prerequisites
+## 2. Cara Setup & Menjalankan Project
 
+### 2.1. Persyaratan Sistem
 - Docker & Docker Compose
 - Python 3.11+
-- [`uv`](https://github.com/astral-sh/uv) (recommended) or pip
+- virtualenv (atau `.venv`)
 
----
-
-## Quick Start
-
-### 1. Clone and set up environment
-
+### 2.2. Setup Lingkungan & Secrets
+Copy `.env.example` ke `.env` dan isi API key milik Anda:
 ```bash
-git clone <repo-url>
-cd agentic-loop
-
-# Copy environment file and fill in your secrets
 cp .env.example .env
-# Edit .env — at minimum set LLM_API_KEY and VEROSIGHT_API_KEY
+# Edit .env: atur LLM_API_KEY dan VEROSIGHT_API_KEY
 ```
 
-### 2. Start PostgreSQL
-
+### 2.3. Menjalankan Docker Service
+Jalankan container PostgreSQL (`rag_db`):
 ```bash
+docker compose up -d
+# Atau menggunakan Makefile:
 make up
-# Starts postgres:16 container and waits for it to be healthy
 ```
 
-### 3. Install dependencies
-
+### 2.4. Instalasi Dependency & Migrasi Database
+Aktifkan virtualenv dan jalankan migrasi database Alembic:
 ```bash
-make install
-# Uses uv if available, falls back to pip
-```
+source .venv/bin/activate
+pip install -r requirements.txt  # atau make install
 
-### 4. Run database migrations
-
-```bash
+# Jalankan migrasi schema ke PostgreSQL
+alembic upgrade head
+# Atau menggunakan Makefile:
 make migrate
-# Runs: alembic upgrade head
 ```
 
-### 5. Start the development server
-
+### 2.5. Menjalankan Server FastAPI
+Jalankan server pengembangan FastAPI dengan hot-reload:
 ```bash
+uvicorn app.main:app --reload --port 8000
+# Atau menggunakan Makefile:
 make dev
-# Starts: uvicorn app.main:app --reload on port 8000
+```
+Akses Swagger UI dokumentasi OpenAPI di: `http://localhost:8000/docs`
+
+---
+
+## 3. Menjalankan Simulasi (CLI & Viewer)
+
+Sistem menyediakan Typer CLI di `scripts/simulate.py` untuk menguji agen secara live tanpa browser/frontend.
+
+### 3.1. Simulasi Pertanyaan Langsung (`simulate ask`)
+```bash
+python scripts/simulate.py ask "Berapa sentimen publik soal program Makan Bergizi Gratis?"
+```
+*CLI akan mencetak pohon trace eksekusi berwarna secara real-time ke terminal.*
+
+### 3.2. Simulasi Seluruh Skenario (`simulate scenarios`)
+Menjalankan seluruh suite skenario end-to-end (termasuk skenario satu-tool, multi-tool, hasil kosong, dan error handling):
+```bash
+python scripts/simulate.py scenarios
+```
+Untuk hanya menjalankan skenario yang ditandai `@pytest.mark.live`:
+```bash
+python scripts/simulate.py scenarios --live-only
 ```
 
-### 6. Verify
+### 3.3. Replay Run berdasarkan ID (`simulate replay`)
+Render ulang trace eksekusi run masa lalu dari database:
+```bash
+python scripts/simulate.py replay <run_id>
+```
+
+### 3.4. Debug Timeline Viewer (HTML)
+Buka peramban untuk melihat timeline visual interaktif (hanya aktif jika `APP_ENV=local`):
+```text
+http://localhost:8000/debug/runs/<run_id>
+```
+
+---
+
+## 4. Observabilitas & Cara Membaca Log
+
+### 4.1. Membaca Structured Logs (JSONL)
+Log agen ditulis dalam format JSON Lines ke `logs/agent.jsonl`. Anda dapat memantau log eksekusi real-time menggunakan `tail` dan `jq`:
 
 ```bash
-curl localhost:8000/health
-# → {"status":"ok"}
-
-curl localhost:8000/docs
-# → OpenAPI Swagger UI (local env only)
+tail -f logs/agent.jsonl | jq .
 ```
 
----
+Filter log khusus event panggilan tool atau error:
+```bash
+tail -f logs/agent.jsonl | jq 'select(.event_type == "tool_result" or .event_type == "error")'
+```
 
-## Available Make Targets
+### 4.2. Prometheus Metrics (`GET /metrics`)
+Metrik observabilitas Prometheus diekspos di endpoint `GET /metrics`:
 
-| Command | Description |
-|---|---|
-| `make up` | Start Docker services (PostgreSQL) |
-| `make down` | Stop Docker services |
-| `make dev` | Start FastAPI dev server with hot reload |
-| `make migrate` | Run Alembic migrations (`upgrade head`) |
-| `make migrate-create` | Create a new migration (prompts for name) |
-| `make test` | Run pytest test suite |
-| `make test-cov` | Run tests with coverage report |
-| `make lint` | Lint with ruff + mypy |
-| `make format` | Auto-format with ruff |
-| `make install` | Install dependencies (uv or pip) |
-
----
-
-## Environment Variables
-
-See [`.env.example`](.env.example) for the full list. Key variables:
-
-| Variable | Description | Default |
+| Nama Metrik | Tipe | Deskripsi |
 |---|---|---|
-| `DATABASE_URL` | Async PostgreSQL URL (must use `+asyncpg`) | `postgresql+asyncpg://postgres:postgres@localhost:5432/rag_db` |
-| `LLM_API_KEY` | OpenAI-compatible API key | `sk-xxx` |
-| `LLM_MODEL` | Model name | `gpt-4o-mini` |
-| `VEROSIGHT_MODE` | `rest` \| `mcp` \| `both` | `mcp` |
+| `runs_total{status}` | Counter | Total eksekusi run per status (`success`, `failed`, `exhausted`, `timeout`) |
+| `iterations_histogram` | Histogram | Distribusi jumlah iterasi per run |
+| `tool_calls_total{tool,status}` | Counter | Jumlah panggilan tool per status (`success`, `error`, `empty`) |
+| `credits_used_total` | Counter | Total kredit tool yang dikonsumsi |
+| `llm_tokens_total` | Counter | Total token LLM yang digunakan |
 
----
-
-## Project Structure
-
-```
-agentic-loop/
-├── app/
-│   ├── main.py          # FastAPI app factory + lifespan
-│   ├── config.py        # pydantic-settings (reads .env)
-│   ├── api/             # HTTP routes
-│   ├── agent/           # Agent loop, planner, state, policy
-│   ├── llm/             # OpenAI-compatible async client
-│   ├── tools/           # Modular tool system (registry, executor)
-│   ├── mcp/             # MCP SSE client + adapter
-│   ├── db/              # SQLAlchemy models, session, repositories
-│   ├── logging/         # structlog setup, RunTracer, formatters
-│   └── schemas/         # Pydantic API schemas
-├── migrations/          # Alembic migration scripts
-├── scripts/
-│   ├── simulate.py      # Local simulation CLI
-│   └── seed_scenarios.py
-├── tests/
-├── docker-compose.yml
-├── pyproject.toml
-├── alembic.ini
-├── Makefile
-└── .env.example
+Tes metrik via curl:
+```bash
+curl http://localhost:8000/metrics
 ```
 
 ---
 
-## Development Notes
+## 5. Cara Menambah Tool Baru
 
-- **No API key?** Set a real `LLM_API_KEY` in `.env`. Without a valid key the
-  agent will fail with a structured `ErrorReport(component="llm", stage="auth")` —
-  no silent mock fallback exists (see PROMPT_PLAN.md §1.6).
-- **Adding a new tool**: Create one file in `app/tools/` and use the `@register_tool` decorator — no changes to core agent code needed.
-- **Trace reasoning**: Agent reasoning is never exposed in API responses. Use `GET /v1/runs/{id}/trace` or the CLI `simulate replay <run_id>`.
+Menambah tool baru sangat sederhana. Cukup buat file `.py` baru di dalam direktori `app/tools/` (atau direktori pembantu di bawahnya) dan gunakan dekorator `@register_tool`. Tool akan **terdeteksi secara otomatis** oleh `ToolRegistry` saat server dinyalakan tanpa mengedit kode inti agen.
+
+Berikut adalah contoh lengkap file pembuat tool baru (**< 30 baris kode**):
+
+```python
+# app/tools/builtin/weather.py
+from __future__ import annotations
+from typing import Any
+from app.tools.registry import register_tool
+
+@register_tool(
+    name="get_weather",
+    description="Mendapatkan perkiraan cuaca terkini untuk nama kota tertentu.",
+    source="local",
+    cost_credits=1,
+    timeout_s=5.0,
+    tags=["weather", "info"],
+)
+async def get_weather(city: str) -> dict[str, Any]:
+    """Mengambil data cuaca berdasarkan nama kota."""
+    # Contoh fungsi eksekusi tool
+    return {
+        "city": city,
+        "temperature_celsius": 28.5,
+        "condition": "Cerah Berawan",
+        "humidity_percent": 75,
+    }
+```
 
 ---
 
-## Prompt Build Plan
+## 6. Architecture Decision Records (ADR)
 
-This project is built incrementally following `docs/PROMPT_PLAN.md`. Current progress:
-
-- [x] **PROMPT 0** — Bootstrap repo & configuration
-- [ ] PROMPT 1 — Database layer & migrations
-- [ ] PROMPT 2 — Logging & tracing core
-- [ ] PROMPT 3 — LLM client (OpenAI-compatible)
-- [ ] PROMPT 4 — Tool registry modular
-- [ ] PROMPT 5 — Verosight REST tools
-- [ ] PROMPT 6 — MCP client & tool ingestion
-- [ ] PROMPT 7 — State management
-- [ ] PROMPT 8 — Agent loop (core)
-- [ ] PROMPT 9 — API layer
-- [ ] PROMPT 10 — Trace viewer & CLI simulation
-- [ ] PROMPT 11 — Local simulation scenarios
-- [ ] PROMPT 12 — Hardening, tests, documentation
+Keputusan arsitektur mendasar dicatat dalam direktori `docs/adr/`:
+- [`0001-only-final-answer-in-query-response.md`](docs/adr/0001-only-final-answer-in-query-response.md): Alasan pengembalian jawaban bersih tanpa proses berpikir pada endpoint `/v1/agent/query`.
+- [`0002-tool-call-deduplication.md`](docs/adr/0002-tool-call-deduplication.md): Strategi deduplikasi & caching hasil tool untuk mencegah loop tak berujung.
+- [`0003-mcp-and-rest-separation.md`](docs/adr/0003-mcp-and-rest-separation.md): Pemisahan integrasi dinamis MCP dan wrapper REST lokal.

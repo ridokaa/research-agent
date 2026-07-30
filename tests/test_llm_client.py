@@ -35,7 +35,6 @@ from app.llm.client import LLMClient, LLMError, _is_retryable
 from app.llm.schemas import (
     FunctionCall,
     LLMResponse,
-    UsageInfo,
     build_function_tool,
     compact_input,
     to_function_call_output,
