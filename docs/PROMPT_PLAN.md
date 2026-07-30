@@ -15,7 +15,7 @@ Jangan lompat tahap — tiap prompt mengasumsikan hasil prompt sebelumnya sudah 
 | Aspek | Keputusan |
 |---|---|
 | Backend | Python 3.11+, FastAPI (async) |
-| LLM | API OpenAI-compatible (base_url + api_key dapat diganti) |
+| LLM | OpenAI **Responses API** — `POST https://api.openai.com/v1/responses` (stateful, tool-native) |
 | DB | PostgreSQL — `postgresql://postgres:postgres@localhost:5432/rag_db` (Docker) |
 | Data source eksternal | Verosight (REST API + MCP server) |
 | Tool system | Modular — tambah tool baru = 1 file + 1 decorator, tanpa sentuh core loop |
@@ -87,7 +87,7 @@ agentic-loop/
 │   │       ├── reflection.md
 │   │       └── finalize.md
 │   ├── llm/
-│   │   ├── client.py            # OpenAI-compatible async client
+│   │   ├── client.py            # OpenAI Responses API async client
 │   │   └── schemas.py
 │   ├── tools/
 │   │   ├── base.py              # BaseTool + ToolResult
@@ -174,8 +174,9 @@ class AgentState(BaseModel):
     user_query: str
     iteration: int = 0
     max_iterations: int = 8
-    messages: list[Message]           # riwayat percakapan (persisted)
+    messages: list[Message]           # riwayat percakapan (persisted, jejak audit)
     execution_memory: list[MemoryItem]  # hasil tool per iterasi
+    last_response_id: str | None = None # id respons OpenAI terakhir (previous_response_id)
     credits_used: int = 0
     credits_budget: int = 100
     started_at: datetime
@@ -190,7 +191,7 @@ messages        (id, conversation_id, role, content, tool_call_id,
                  tool_name, seq, token_in, token_out, created_at)
 runs            (id, conversation_id, user_query, status, final_answer,
                  iterations, credits_used, total_tokens, latency_ms,
-                 error, started_at, finished_at)
+                 last_response_id, error, started_at, finished_at)
 run_steps       (id, run_id, seq, iteration, type, summary, payload jsonb,
                  duration_ms, created_at)
 tool_invocations(id, run_id, step_seq, tool_name, source, arguments jsonb,
@@ -214,13 +215,15 @@ LOG_FILE=./logs/agent.jsonl
 # Database
 DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/rag_db
 
-# LLM (OpenAI-compatible)
+# LLM (OpenAI Responses API — POST {LLM_BASE_URL}/responses)
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_API_KEY=sk-xxx
 LLM_MODEL=gpt-4o-mini
 LLM_TEMPERATURE=0.2
-LLM_MAX_TOKENS=2048
+LLM_MAX_OUTPUT_TOKENS=2048
 LLM_TIMEOUT_S=60
+LLM_STORE=true              # simpan state di server OpenAI → pakai previous_response_id
+LLM_REASONING_EFFORT=       # isi (low/medium/high) hanya untuk model reasoning; kosongkan bila tidak
 
 # Agent loop
 AGENT_MAX_ITERATIONS=8
@@ -236,8 +239,8 @@ VEROSIGHT_ENABLED=true
 VEROSIGHT_MODE=mcp          # rest | mcp | both
 
 # Simulasi
-MOCK_LLM=false
-MOCK_TOOLS=false
+MOCK_LLM=false             # true → loop diuji tanpa memanggil OpenAI (pakai skrip fixture)
+MOCK_TOOLS=false           # HANYA untuk tool builtin & MCP; Verosight REST selalu memanggil API asli
 ```
 
 ---
@@ -344,31 +347,57 @@ dan bahwa flush() menulis semua event ke run_steps.
 
 ---
 
-### PROMPT 3 — LLM client (OpenAI-compatible)
+### PROMPT 3 — LLM client (OpenAI Responses API)
 
 ```text
-Implementasikan app/llm/client.py: async client untuk endpoint OpenAI-compatible.
+Implementasikan app/llm/client.py: async client untuk OpenAI Responses API
+(POST {LLM_BASE_URL}/responses). PENTING: ini BUKAN chat/completions. Formatnya
+berbeda dan tidak boleh dicampur — memakai definisi tool gaya chat completions
+di endpoint /responses adalah penyebab error "invalid parameter" paling umum.
+
+Perbedaan kunci Responses API yang wajib dipatuhi:
+- Request memakai `input` (bukan `messages`) + `instructions` (untuk system prompt).
+  `input` boleh string atau array of items.
+- Definisi tool FLAT — tidak ada nested "function":
+  {"type":"function","name":"...","description":"...","parameters":{...JSON Schema...}}
+- Model mengembalikan tool call sebagai item top-level di `response.output` dengan
+  type="function_call", berisi call_id, name, arguments (string JSON).
+- Hasil tool dikirim balik sebagai item {"type":"function_call_output",
+  "call_id":"...","output":"...string..."}.
+- State server-side: kirim `previous_response_id` + `store=true` supaya tidak perlu
+  mengirim ulang seluruh riwayat pada iterasi berikutnya.
+- Usage memakai input_tokens / output_tokens (bukan prompt/completion_tokens).
+- JSON mode via text.format = {"type":"json_object"} (bukan response_format).
 
 Requirement:
-- Class LLMClient(base_url, api_key, model, timeout) memakai httpx.AsyncClient.
-- Method: async chat(messages, tools=None, tool_choice="auto", temperature=None,
-  max_tokens=None) -> LLMResponse.
-- LLMResponse berisi: content (str|None), tool_calls (list[ToolCall]),
-  finish_reason, usage(prompt_tokens, completion_tokens), raw.
-- Dukung format tool calling standar OpenAI (tools=[{type:"function",function:{...}}]),
-  dan tangani model yang mengembalikan tool_calls di dalam delta maupun non-stream.
+- Class LLMClient(base_url, api_key, model, timeout, store) memakai httpx.AsyncClient.
+- Method utama:
+  async respond(input, instructions=None, tools=None, tool_choice="auto",
+                previous_response_id=None, temperature=None,
+                max_output_tokens=None, text_format=None) -> LLMResponse
+- LLMResponse berisi: response_id, output_text (str|None),
+  function_calls (list[FunctionCall{call_id,name,arguments_dict}]),
+  status/incomplete_reason, usage(input_tokens, output_tokens), raw.
+  Parse `response.output`: pisahkan item type="message" (ambil teksnya) dari
+  type="function_call". Arguments di-json.loads dengan guard bila string invalid.
+- Helper: build_function_tool(spec) → dict flat; to_function_call_output(call_id,
+  result_text) → item input untuk iterasi berikutnya.
 - Retry dengan tenacity: 3x exponential backoff untuk 429/500/502/503/timeout,
   TIDAK retry untuk 400/401.
 - Setiap panggilan memancarkan trace event llm_request & llm_response lewat
-  RunTracer yang di-inject (opsional, boleh None).
+  RunTracer yang di-inject (opsional, boleh None). Simpan response_id di trace
+  supaya rantai previous_response_id bisa ditelusuri.
 - Mode MOCK_LLM=true: pakai app/llm/mock.py yang membaca skenario dari
-  tests/fixtures/llm_scripts/*.json sehingga loop bisa diuji tanpa API key.
-- Guard: jika total token perkiraan melebihi batas, panggil fungsi
-  compact_messages() yang meringkas pesan lama (sisakan system + N pesan terakhir
-  + ringkasan). Sediakan hook-nya sekarang, implementasi ringkas boleh sederhana.
+  tests/fixtures/llm_scripts/*.json (tiap langkah = output_text atau function_calls),
+  sehingga loop bisa diuji tanpa API key.
+- Guard konteks: bila store=false (tidak pakai previous_response_id), sediakan
+  compact_input() yang meringkas item lama (sisakan instruksi + N item terakhir
+  + ringkasan). Sediakan hook-nya sekarang; implementasi boleh sederhana.
 
-Definition of Done: test dengan respx memverifikasi (a) parsing tool_calls,
-(b) retry pada 429, (c) tidak retry pada 401, (d) mock mode menghasilkan
+Definition of Done: test dengan respx memverifikasi (a) parsing item function_call
+dari response.output, (b) definisi tool ter-serialisasi FLAT (tidak ada key
+"function" bersarang), (c) function_call_output terbentuk benar untuk iterasi
+lanjutan, (d) retry pada 429 & tidak retry pada 401, (e) mock mode menghasilkan
 urutan respon sesuai skrip.
 ```
 
@@ -388,7 +417,9 @@ di app/tools/ tanpa mengubah satu baris pun di app/agent/.
 
 2. app/tools/registry.py:
    - ToolRegistry: register(tool), get(name), list_specs(tags=None),
-     to_openai_tools() -> list[dict].
+     to_responses_tools() -> list[dict]. Output HARUS format flat Responses API:
+     {"type":"function","name":..,"description":..,"parameters":{..JSON Schema..}}
+     — TANPA nested "function". (Jangan pakai format chat/completions.)
    - Decorator @register_tool untuk fungsi sederhana:
 
      @register_tool(name="calculator", description="...", cost_credits=0)
@@ -430,6 +461,12 @@ memverifikasi schema-nya benar, argumen invalid menghasilkan ToolResult error
 ```text
 Implementasikan integrasi Verosight lewat REST API sebagai tool lokal.
 
+PENTING — dua aturan tegas untuk tahap ini:
+- TANPA mock dan TANPA fallback. Tool Verosight SELALU memanggil API asli
+  (https://api.verosight.com). Abaikan flag MOCK_TOOLS untuk tool-tool ini.
+- Jika terjadi error, JANGAN menyembunyikannya. Laporkan dengan jelas bagian
+  MANA yang gagal (lihat poin 4).
+
 Referensi API (base: https://api.verosight.com):
 - Auth: header `X-API-Key: vlt_live_...`, atau tukar ke JWT via
   POST /v1/auth/token (berlaku 24 jam) lalu pakai `Authorization: Bearer ...`.
@@ -442,9 +479,8 @@ Referensi API (base: https://api.verosight.com):
 1. app/tools/verosight/client.py: VerosightClient
    - httpx.AsyncClient dengan base_url + header auth, auto-refresh JWT.
    - Parsing envelope: kembalikan data + rekam credits_used ke ToolResult.
-   - Handling khusus: 402 insufficient_credits → status "error" dengan pesan
-     eksplisit agar agen berhenti memakai tool berbayar; 429 → backoff sesuai
-     X-RateLimit-Reset.
+   - Handling: 402 insufficient_credits → status "error", pesan eksplisit agar
+     agen berhenti memakai tool berbayar; 429 → backoff sesuai X-RateLimit-Reset.
 
 2. Bungkus endpoint berikut sebagai tool (satu fungsi per tool, argumen tervalidasi
    pydantic, deskripsi ditulis untuk dibaca LLM — sebutkan kapan tool ini dipakai):
@@ -456,26 +492,35 @@ Referensi API (base: https://api.verosight.com):
                   verosight_sentiment_trend GET /v1/analytics/sentiment-trend (3cr)
                   verosight_trending        GET /v1/analytics/trending (5cr)
                   verosight_topics          GET /v1/analytics/topics (5cr)
-                  verosight_volume          GET /v1/analytics/volume (5cr)
-                  verosight_hashtags        GET /v1/analytics/hashtags (3cr)
-                  verosight_experts         GET /v1/analytics/experts (5cr)
-                  verosight_share_of_voice  GET /v1/analytics/share-of-voice (5cr)
-   profiles.py  : verosight_get_profile     GET /v1/profiles/{platform}/{name} (1cr)
-                  verosight_profile_stats   GET /v1/profiles/{platform}/{name}/stats (5cr)
-                  verosight_compare         GET /v1/analytics/compare (5cr)
-   account.py   : verosight_balance         GET /v1/account/balance (0cr)
 
    Isi cost_credits pada ToolSpec sesuai angka di atas — dipakai budget guard.
+   (Hanya tujuh tool ini. Jangan tambahkan endpoint lain di tahap ini.)
 
 3. Ringkas respons sebelum dikembalikan ke LLM: buang field media_urls kosong,
    batasi sample_* jadi maks 5 item, pertahankan angka agregat. Simpan respons
    penuh ke tool_invocations.result.
 
-4. MOCK_TOOLS=true → semua tool Verosight membaca fixture JSON di
-   tests/fixtures/verosight/ sehingga simulasi lokal jalan tanpa API key.
+4. Pelaporan error yang eksplisit — inti dari tahap ini. Tambahkan field
+   error_stage pada ToolResult (atau di dalam error message) yang menyebutkan
+   persis di tahap mana kegagalan terjadi:
+     - "auth_token"        → gagal menukar API key jadi JWT / API key invalid (401)
+     - "http_request"      → koneksi/timeout/DNS ke api.verosight.com gagal
+     - "rate_limited"      → 429 (sertakan detik reset)
+     - "insufficient_credits" → 402 (sertakan kredit dibutuhkan vs tersisa)
+     - "not_found"         → 404 (endpoint/profil tidak ada)
+     - "envelope_parse"    → respons 2xx tapi struktur {data,meta} tak sesuai
+     - "validation"        → argumen dari LLM tidak lolos schema (sebelum request)
+     - "server_error"      → 5xx dari Verosight
+   Selalu sertakan request_id dari meta bila tersedia, endpoint yang dipanggil,
+   dan HTTP status. Pesan ditulis agar (a) developer tahu harus cek apa, dan
+   (b) LLM bisa memutuskan langkah berikutnya (mis. ganti argumen saat validation).
+   Semua ini dikembalikan sebagai ToolResult(status="error"), BUKAN exception yang
+   menghentikan run.
 
-Definition of Done: test respx untuk sukses, 402, dan 429; verifikasi
-credits_used terakumulasi ke AgentState.
+Definition of Done: test respx untuk sukses, 401, 402, 429, 5xx, dan envelope
+rusak — masing-masing menghasilkan error_stage yang benar. Verifikasi credits_used
+terakumulasi ke AgentState. Tidak ada jalur kode yang membaca fixture sebagai
+pengganti panggilan nyata (respx di sini hanya alat test, bukan mode mock aplikasi).
 ```
 
 ---
@@ -543,6 +588,10 @@ Implementasikan app/agent/state.py.
 3. ConversationHistory: load riwayat dari tabel messages saat run dimulai,
    append pesan baru (user, assistant, tool) selama loop, persist di akhir tiap
    iterasi (bukan hanya di akhir run — supaya crash tetap meninggalkan jejak).
+   Catatan Responses API: state percakapan juga dipegang server OpenAI lewat
+   previous_response_id (LLM_STORE=true). Persist lokal tetap wajib untuk trace &
+   audit; simpan last_response_id di runs agar rantai respons bisa direkonstruksi.
+   Bila LLM_STORE=false, riwayat lokal inilah yang dipadatkan dan dikirim ulang.
 
 4. Snapshot per iterasi: setiap akhir iterasi tulis baris ke execution_memory
    (run_id, iteration, key, value, origin_tool) sehingga trace bisa menampilkan
@@ -563,16 +612,20 @@ Implementasikan app/agent/loop.py — AgentLoop.
 Signature: async def run(user_query: str, conversation_id: UUID | None,
                          options: RunOptions) -> RunResult
 
-Alur per iterasi:
-1. planner.build_messages(state) → [system prompt, riwayat ringkas,
-   execution memory block, pesan user, instruksi iterasi saat ini]
-2. llm.chat(messages, tools=registry.to_openai_tools())
-3. Jika response.tool_calls tidak kosong:
+Alur per iterasi (Responses API):
+1. planner.build_request(state) → instructions (system prompt terisi) + input.
+   Pada iterasi pertama input = pertanyaan user (+ execution memory block bila ada).
+   Pada iterasi lanjutan, bila store=true cukup kirim item baru + previous_response_id;
+   bila store=false kirim input yang sudah dipadatkan.
+2. llm.respond(input, instructions=..., tools=registry.to_responses_tools(),
+   previous_response_id=state.last_response_id). Simpan response_id ke state.
+3. Jika response.function_calls tidak kosong:
      - trace "tool_selected" (daftar nama + argumen)
      - executor.execute untuk semua tool (paralel bila diizinkan)
-     - append pesan role="tool" ke history, tulis ke execution memory
+     - untuk tiap hasil, bentuk item function_call_output (call_id + output ringkas),
+       kumpulkan sebagai input iterasi berikutnya; tulis juga ke execution memory
      - iteration += 1, lanjut loop
-4. Jika response.content ada dan tool_calls kosong:
+4. Jika response.output_text ada dan function_calls kosong:
      - jalankan self-check: panggil LLM sekali dengan prompts/finalize.md
        yang menanyakan apakah jawaban sudah didukung data yang diperoleh
        (jawab JSON: {"is_final": bool, "reason": str, "missing": str|null}).
@@ -681,23 +734,31 @@ Buat scripts/seed_scenarios.py berisi skenario uji end-to-end yang
 merepresentasikan pemakaian nyata:
 
 1. "Jawab langsung"     — pertanyaan umum, agen menjawab tanpa tool (1 iterasi).
-2. "Satu tool"          — "berapa sisa kredit Verosight saya?" → verosight_balance.
+2. "Satu tool"          — "apa yang sedang tren minggu ini?" → verosight_trending.
 3. "Multi-tool berantai"— "bagaimana sentimen publik soal <topik> minggu ini dan
-                           siapa akun paling berpengaruh?" → get_sentiment →
-                           find_experts → sintesis.
+                           topik apa yang muncul?" → verosight_sentiment →
+                           verosight_topics → sintesis.
 4. "Hasil kosong"       — keyword yang tidak ada datanya → tool mengembalikan
                            status empty → agen mengubah strategi (perlebar rentang
                            hari / ganti keyword) → menjawab dengan jujur.
-5. "Tool error"         — simulasikan 429 lalu 402 → agen berhenti memakai tool
-                           berbayar dan menjawab dengan data seadanya.
+5. "Tool error"         — Verosight mengembalikan 429 lalu 402 → error_stage
+                           terlaporkan jelas, agen berhenti memakai tool berbayar
+                           dan menjawab dengan data seadanya.
 6. "Budget habis"       — credits_budget=5 → status exhausted, jawaban tetap ada.
 7. "Percakapan lanjutan"— 2 request berurutan dengan conversation_id sama,
                            request kedua merujuk hasil pertama ("bandingkan dengan
-                           minggu lalu") → verifikasi riwayat terpakai.
+                           minggu lalu") → verifikasi riwayat/previous_response_id
+                           terpakai.
 
 Setiap skenario punya assertion: status akhir, jumlah iterasi maksimum,
 tool yang dipanggil, dan bahwa answer tidak kosong.
-Semua harus lulus dengan --mock (tanpa jaringan) dan opsional dengan API asli.
+
+Catatan mode: skenario 1, 4, 5, 6 menguji LOGIKA LOOP dan bisa lulus penuh dengan
+--mock (MOCK_LLM + tool builtin/MCP mock) tanpa jaringan. Skenario 2, 3, 7 menyentuh
+Verosight REST yang tidak punya mock (lihat PROMPT 5), jadi butuh VEROSIGHT_API_KEY
+asli dan akan memakai kredit — tandai skenario ini agar bisa di-skip di CI
+(mis. marker pytest "live"). Kegagalan jaringan pada skenario live harus muncul
+sebagai error_stage yang informatif, bukan crash.
 ```
 
 ---
@@ -742,7 +803,8 @@ Database bernama rag_db — tambahkan lapisan retrieval lokal sebagai tool.
 1. Aktifkan extension pgvector, tabel documents(id, source, title, content,
    metadata jsonb, created_at) dan chunks(id, document_id, chunk_index, content,
    embedding vector(N), token_count).
-2. Embedding lewat endpoint OpenAI-compatible yang sama (config EMBEDDING_MODEL).
+2. Embedding lewat endpoint OpenAI /v1/embeddings (terpisah dari Responses API;
+   config EMBEDDING_MODEL, reuse LLM_BASE_URL & LLM_API_KEY).
 3. Tool `rag_search(query, top_k=5, filters=None)` — hybrid: cosine similarity
    + ILIKE keyword fallback, kembalikan potongan teks + skor + sumber.
 4. Tool `rag_ingest(text|url, metadata)` untuk memasukkan dokumen (chunking
@@ -829,7 +891,9 @@ yang belum terjawab, atau data yang ada bertentangan.
 - [ ] Tool gagal / kosong / 429 / 402 → agen tetap menghasilkan jawaban
 - [ ] `max_iterations` tercapai → status `exhausted`, jawaban tetap ada
 - [ ] API key tidak muncul di log, trace, maupun response
-- [ ] `python scripts/simulate.py scenarios --mock` → semua skenario lulus tanpa jaringan
+- [ ] `python scripts/simulate.py scenarios --mock` → skenario logika loop (1,4,5,6) lulus tanpa jaringan
+- [ ] Skenario Verosight (2,3,7) → jalan dengan API key asli; error apa pun muncul dengan `error_stage` jelas
+- [ ] Client LLM memakai Responses API: tool ter-serialisasi flat, `previous_response_id` terpakai antar-iterasi
 
 ---
 
@@ -842,9 +906,12 @@ kredit, dan jadi fallback saat MCP server tidak tersedia. Mode `both` sebaiknya
 hanya dipakai untuk perbandingan, karena tool duplikat cenderung membingungkan LLM.
 
 **Hemat kredit saat development.** Setiap panggilan Verosight menghabiskan kredit
-(2–20 per call, akun gratis 1.000 kredit). Selalu kembangkan dengan `MOCK_TOOLS=true`;
-rekam beberapa respons asli sekali saja ke `tests/fixtures/verosight/` lalu pakai
-terus sebagai fixture.
+(2–20 per call, akun gratis 1.000 kredit). Tool Verosight REST (PROMPT 5) sengaja
+TIDAK punya mock — jadi kembangkan logika loop dengan `MOCK_LLM=true` (tidak
+menyentuh Verosight sama sekali), dan barulah uji jalur Verosight dengan API asli
+saat memang perlu. Karena tidak ada fallback, tiap error Verosight muncul apa adanya
+lewat `error_stage` — inilah yang dipakai untuk tahu bagian mana yang gagal
+(auth, request, kredit, rate limit, atau parsing envelope).
 
 **Penyebab loop tak berujung yang paling sering** — tangani sejak PROMPT 8:
 LLM memanggil tool yang sama berulang karena hasilnya kosong. Kombinasi
