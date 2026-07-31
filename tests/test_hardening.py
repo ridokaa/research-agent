@@ -129,8 +129,14 @@ async def test_parallel_runs_race_condition():
 
     factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
 
+    from app.db.repositories.conversation import ConversationRepo
+    async with factory() as session_setup:
+        conv_repo = ConversationRepo(session_setup)
+        conv = await conv_repo.create()
+        await session_setup.commit()
+        conv_id = conv.id
+
     async with factory() as session1, factory() as session2:
-        conv_id = uuid.uuid4()
         options = RunOptions(max_iterations=1, credits_budget=10)
 
         loop1 = AgentLoop(session=session1, llm_client=mock_llm)

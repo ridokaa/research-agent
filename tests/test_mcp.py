@@ -173,8 +173,9 @@ async def test_mcp_client_auto_reconnect_retry_success():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_mcp_manager_startup_graceful_degradation():
+async def test_mcp_manager_startup_graceful_degradation(monkeypatch):
     """If server fails to connect on startup, log warning and register tools as unavailable."""
+    monkeypatch.setenv("VEROSIGHT_MODE", "mcp")
     manager = MCPManager()
 
     with patch.object(MCPClient, "list_tools", side_effect=ConnectionError("Server offline")):

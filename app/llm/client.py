@@ -30,7 +30,7 @@ Error taxonomy (§1.6 PROMPT_PLAN, PROMPT 3):
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import structlog
@@ -41,7 +41,14 @@ from tenacity import (
     wait_exponential,
 )
 
-from app.llm.schemas import LLMResponse, build_function_tool, compact_input
+from app.llm.schemas import (
+    LLMResponse,
+    build_chat_tool,
+    build_function_tool,
+    compact_input,
+    to_chat_messages,
+    to_chat_tool_output,
+)
 from app.schemas.errors import ErrorReport
 
 log = structlog.get_logger(__name__)
@@ -86,31 +93,26 @@ def _build_retry_decorator() -> Any:
 
 
 class LLMClient:
-    """Async client for the OpenAI Responses API (POST /responses).
+    """Async client for OpenAI LLM services (Responses API or Chat Completions API).
 
     Parameters
     ----------
     base_url:
-        Base URL, e.g. ``https://api.openai.com/v1``.  The client appends
-        ``/responses`` automatically.
+        Base URL, e.g. ``https://api.openai.com/v1``.
     api_key:
-        OpenAI API key (Bearer token).  If blank or equal to the placeholder
-        ``"sk-xxx"``, :meth:`respond` raises immediately with
-        ``ErrorReport(stage="missing_api_key")`` before making any HTTP call.
+        OpenAI API key (Bearer token).
     model:
-        Model identifier, e.g. ``"gpt-4o-mini"``.
+        Model identifier, e.g. ``"gpt-4o-mini"`` or ``"deepseek-v4-pro"``.
     timeout:
         HTTP timeout in seconds.
     store:
-        If *True*, pass ``store=true`` to the API so the server retains
-        conversation state.  Enables ``previous_response_id`` chaining.
+        If *True*, pass ``store=true`` to the API (Responses API only).
     tracer:
-        Optional :class:`~app.logging.tracer.RunTracer` instance.  When
-        provided, the client emits ``llm_request``, ``llm_response``, and
-        ``error`` trace events (with redaction).
+        Optional RunTracer instance.
     reasoning_effort:
-        Optional reasoning effort hint (``"low"`` / ``"medium"`` / ``"high"``)
-        for models that support it.  ``None`` means omit the field entirely.
+        Optional reasoning effort hint ("low" / "medium" / "high").
+    api_style:
+        API style: ``"responses"`` (POST /responses) or ``"chat_completions"`` (POST /chat/completions).
     """
 
     def __init__(
@@ -122,14 +124,20 @@ class LLMClient:
         store: bool = True,
         tracer: Any | None = None,
         reasoning_effort: str | None = None,
+        api_style: Literal["responses", "chat_completions"] = "responses",
     ) -> None:
-        self._endpoint = base_url.rstrip("/") + "/responses"
+        if api_style == "chat_completions":
+            self._endpoint = base_url.rstrip("/") + "/chat/completions"
+        else:
+            self._endpoint = base_url.rstrip("/") + "/responses"
+
         self._api_key = api_key
         self._model = model
         self._timeout = timeout
         self._store = store
         self._tracer = tracer
         self._reasoning_effort = reasoning_effort
+        self._api_style = api_style
 
         self._http = httpx.AsyncClient(
             headers={
@@ -169,39 +177,13 @@ class LLMClient:
         max_output_tokens: int | None = None,
         text_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
-        """Call the Responses API and return a parsed :class:`LLMResponse`.
+        """Call the LLM API (Responses or Chat Completions) and return a parsed :class:`LLMResponse`.
 
         Raises
         ------
         LLMError
             Wraps an :class:`~app.schemas.errors.ErrorReport` for every failure
             category (see module docstring for the stage taxonomy).
-
-        Parameters
-        ----------
-        input:
-            Either a plain string or a list of input items (messages, tool
-            outputs, etc.).  Corresponds to the ``input`` field in the API
-            request — NOT ``messages``.
-        instructions:
-            System-level instructions.  Corresponds to the ``instructions``
-            field (not ``system`` role in messages).
-        tools:
-            Flat tool definitions.  Each dict should already be in the flat
-            format (use :func:`~app.llm.schemas.build_function_tool` to
-            convert specs).  The client validates that no nested ``"function"``
-            key is present and raises ``ValueError`` if detected.
-        tool_choice:
-            ``"auto"``, ``"none"``, ``"required"``, or a specific tool dict.
-        previous_response_id:
-            ID of the previous response to continue from (server-side state).
-        temperature:
-            Sampling temperature.  Omitted from the request if ``None``.
-        max_output_tokens:
-            Max tokens in the response.  Omitted if ``None``.
-        text_format:
-            Dict for ``text.format``, e.g. ``{"type": "json_object"}``.
-            Use this for JSON mode — NOT ``response_format``.
         """
         # ------------------------------------------------------------------
         # Guard: missing or placeholder API key — fail explicitly before HTTP
@@ -227,22 +209,33 @@ class LLMClient:
             input = compact_input(input, keep_last_n=10)  # noqa: A001
 
         # ------------------------------------------------------------------
-        # Validate tools are in flat format
+        # Tool formatting & validation per API style
         # ------------------------------------------------------------------
+        formatted_tools: list[dict[str, Any]] | None = None
         if tools:
-            for t in tools:
-                if "function" in t:
-                    raise ValueError(
-                        f"Tool '{t.get('name', '?')}' uses nested 'function' key — "
-                        "this is the chat/completions format. "
-                        "Responses API requires FLAT format: "
-                        '{"type":"function","name":"...","description":"...","parameters":{...}}'
-                    )
+            if self._api_style == "responses":
+                for t in tools:
+                    if "function" in t:
+                        raise ValueError(
+                            f"Tool '{t.get('name', '?')}' uses nested 'function' key — "
+                            "this is the chat/completions format. "
+                            "Responses API requires FLAT format: "
+                            '{"type":"function","name":"...","description":"...","parameters":{...}}'
+                        )
+                formatted_tools = tools
+            else:
+                # Chat completions style: ensure tools are in nested format
+                formatted_tools = []
+                for t in tools:
+                    if "function" in t and "type" in t:
+                        formatted_tools.append(t)
+                    else:
+                        formatted_tools.append(build_chat_tool(t))
 
         payload = self._build_payload(
             input=input,
             instructions=instructions,
-            tools=tools,
+            tools=formatted_tools,
             tool_choice=tool_choice,
             previous_response_id=previous_response_id,
             temperature=temperature,
@@ -398,7 +391,25 @@ class LLMClient:
         max_output_tokens: int | None,
         text_format: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Assemble the JSON payload for the Responses API request."""
+        """Assemble the JSON payload for the request per _api_style."""
+        if self._api_style == "chat_completions":
+            messages = to_chat_messages(input, instructions=instructions)
+            payload: dict[str, Any] = {
+                "model": self._model,
+                "messages": messages,
+            }
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = tool_choice
+            if temperature is not None:
+                payload["temperature"] = temperature
+            if max_output_tokens is not None:
+                payload["max_tokens"] = max_output_tokens
+            if text_format is not None:
+                payload["response_format"] = {"type": "json_object"}
+            return payload
+
+        # Responses API style
         payload: dict[str, Any] = {
             "model": self._model,
             "input": input,
@@ -458,6 +469,23 @@ class LLMClient:
     def build_function_tool(spec: dict[str, Any]) -> dict[str, Any]:
         """See :func:`~app.llm.schemas.build_function_tool`."""
         return build_function_tool(spec)
+
+    @staticmethod
+    def build_chat_tool(spec: dict[str, Any]) -> dict[str, Any]:
+        """See :func:`~app.llm.schemas.build_chat_tool`."""
+        return build_chat_tool(spec)
+
+    @staticmethod
+    def to_chat_tool_output(call_id: str, result_text: str) -> dict[str, Any]:
+        """See :func:`~app.llm.schemas.to_chat_tool_output`."""
+        return to_chat_tool_output(call_id, result_text)
+
+    @staticmethod
+    def to_chat_messages(
+        input_data: str | list[dict[str, Any]], instructions: str | None = None
+    ) -> list[dict[str, Any]]:
+        """See :func:`~app.llm.schemas.to_chat_messages`."""
+        return to_chat_messages(input_data, instructions=instructions)
 
     @staticmethod
     def compact_input(

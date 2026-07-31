@@ -138,6 +138,7 @@ class AgentLoop:
                 store=opts.store,
                 tracer=tracer,
                 reasoning_effort=settings.LLM_REASONING_EFFORT,
+                api_style=settings.LLM_API_STYLE,
             )
 
         state = AgentState(
@@ -203,7 +204,8 @@ class AgentLoop:
 
                 # --- 2. LLM respond ---
                 try:
-                    tools_def = registry.to_responses_tools()
+                    api_style = getattr(llm, "_api_style", settings.LLM_API_STYLE)
+                    tools_def = registry.to_tools(api_style=api_style)
                     if opts.tools_allow is not None:
                         tools_def = [t for t in tools_def if t.get("name") in opts.tools_allow]
                     if opts.tools_deny is not None:

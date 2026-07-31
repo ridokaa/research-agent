@@ -143,7 +143,7 @@ class MCPManager:
                 self._tool_cache[alias] = (specs, now)
                 logger.info("mcp.server_connected", alias=alias, tools=len(specs))
 
-            except Exception as exc:  # noqa: BLE001
+            except BaseException as exc:  # noqa: BLE001
                 logger.warning(
                     "mcp.server_connect_failed",
                     alias=alias,

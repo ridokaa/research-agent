@@ -95,7 +95,19 @@ def _redact(obj: Any, _depth: int = 0) -> Any:
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
         for k, v in obj.items():
-            if isinstance(k, str) and (_REDACT_PATTERN.fullmatch(k.lower()) or "key" in k.lower() or "secret" in k.lower() or "token" in k.lower()):
+            k_lower = k.lower() if isinstance(k, str) else ""
+            is_secret_key = (
+                _REDACT_PATTERN.fullmatch(k_lower)
+                or "secret" in k_lower
+                or (
+                    ("token" in k_lower or "auth" in k_lower or "key" in k_lower)
+                    and not k_lower.endswith("tokens")
+                    and "token_in" not in k_lower
+                    and "token_out" not in k_lower
+                    and k_lower != "tokens"
+                )
+            )
+            if is_secret_key:
                 out[k] = "***"
             else:
                 out[k] = _redact(v, _depth + 1)

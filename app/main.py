@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             mcp_manager = get_mcp_manager()
             await mcp_manager.connect_all()
             logger.info("startup.mcp_connected")
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
         logger.warning("startup.mcp_connect_failed", error=str(exc))
 
     logger.info("startup.complete")

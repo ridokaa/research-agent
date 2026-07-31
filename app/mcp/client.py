@@ -84,14 +84,14 @@ class MCPClient:
             self._session = session
             self._is_connected = True
             logger.info("mcp.client_connected", alias=self.alias, transport=self.transport)
-        except Exception as exc:
+        except BaseException as exc:
             logger.warning("mcp.client_connect_failed", alias=self.alias, error=str(exc))
             await self.close()
             raise exc
 
     async def list_tools(self) -> list[Tool]:
         """List available tools from the MCP server with auto-reconnect."""
-        last_exc: Exception | None = None
+        last_exc: BaseException | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 if not self.is_connected:
@@ -99,7 +99,7 @@ class MCPClient:
                 assert self._session is not None
                 res = await self._session.list_tools()
                 return res.tools
-            except Exception as exc:
+            except BaseException as exc:
                 last_exc = exc
                 logger.warning(
                     "mcp.list_tools_error",
@@ -118,7 +118,7 @@ class MCPClient:
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> CallToolResult:
         """Execute a tool call on the MCP server with auto-reconnect."""
-        last_exc: Exception | None = None
+        last_exc: BaseException | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 if not self.is_connected:
@@ -126,7 +126,7 @@ class MCPClient:
                 assert self._session is not None
                 res = await self._session.call_tool(name=name, arguments=arguments or {})
                 return res
-            except Exception as exc:
+            except BaseException as exc:
                 last_exc = exc
                 logger.warning(
                     "mcp.call_tool_error",

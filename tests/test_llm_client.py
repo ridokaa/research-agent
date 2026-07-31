@@ -37,9 +37,11 @@ from app.llm.schemas import (
     LLMResponse,
     build_function_tool,
     compact_input,
+    to_chat_messages,
     to_function_call_output,
 )
 from app.schemas.errors import ErrorReport
+from app.tools.registry import get_registry
 
 BASE_URL = "https://api.openai.com/v1"
 RESPONSES_URL = f"{BASE_URL}/responses"
@@ -645,3 +647,246 @@ class TestLiveErrorBehaviour:
             assert elapsed < 5.0, f"401 should not be retried but took {elapsed:.1f}s"
         finally:
             await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_llm_client_http_status_errors(respx_mock):
+    """Verify HTTP 401, 429, 500, 400 error stages in LLMClient."""
+    client = LLMClient(base_url="https://api.openai.com/v1", api_key="sk-test-key", model="gpt-4o-mini")
+
+    # 401 Auth
+    respx_mock.post("https://api.openai.com/v1/responses").mock(return_value=httpx.Response(401))
+    with pytest.raises(LLMError) as exc:
+        await client.respond(input="test")
+    assert exc.value.report.stage == "auth"
+
+    # 429 Rate limited
+    respx_mock.post("https://api.openai.com/v1/responses").mock(return_value=httpx.Response(429))
+    with pytest.raises(LLMError) as exc:
+        await client.respond(input="test")
+    assert exc.value.report.stage == "rate_limited"
+
+    # 500 Server error
+    respx_mock.post("https://api.openai.com/v1/responses").mock(return_value=httpx.Response(500))
+    with pytest.raises(LLMError) as exc:
+        await client.respond(input="test")
+    assert exc.value.report.stage == "server_error"
+
+    # 400 Bad request
+    respx_mock.post("https://api.openai.com/v1/responses").mock(return_value=httpx.Response(400))
+    with pytest.raises(LLMError) as exc:
+        await client.respond(input="test")
+    assert exc.value.report.stage == "http_request"
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_llm_client_response_parse_error(respx_mock):
+    """Verify response parsing failure surfaces response_parse stage."""
+    client = LLMClient(base_url="https://api.openai.com/v1", api_key="sk-test-key", model="gpt-4o-mini")
+    respx_mock.post("https://api.openai.com/v1/responses").mock(return_value=httpx.Response(200, json={"output": "invalid_structure_not_dict"}))
+    with pytest.raises(LLMError) as exc:
+        await client.respond(input="test")
+    assert exc.value.report.stage == "response_parse"
+    await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Chat Completions Adapter Tests (Definition of Done)
+# ---------------------------------------------------------------------------
+
+
+class TestChatCompletionsTools:
+    """Test tool serialization for Chat Completions API."""
+
+    def test_to_chat_tools_nested_format(self):
+        """to_chat_tools must produce nested {"type":"function","function":{...}}."""
+        registry = get_registry()
+        chat_tools = registry.to_chat_tools()
+        assert isinstance(chat_tools, list)
+        for t in chat_tools:
+            assert t.get("type") == "function"
+            assert "function" in t
+            assert "name" in t["function"]
+            assert "parameters" in t["function"]
+
+    def test_build_chat_tool(self):
+        """build_chat_tool produces correct nested dict."""
+        spec = {
+            "name": "calc",
+            "description": "Calculator",
+            "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}},
+        }
+        res = LLMClient.build_chat_tool(spec)
+        assert res == {
+            "type": "function",
+            "function": {
+                "name": "calc",
+                "description": "Calculator",
+                "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}},
+            },
+        }
+
+
+class TestChatCompletionsResponseParsing:
+    """Test parsing choices[0].message and usage for Chat Completions API."""
+
+    def test_parses_chat_raw_choices_message(self):
+        """from_chat_raw maps content, usage (prompt/completion tokens), and finish_reason."""
+        raw = {
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "deepseek-v4-pro",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hello world!"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 15,
+                "completion_tokens": 8,
+                "total_tokens": 23,
+            },
+        }
+        resp = LLMResponse.from_raw(raw)
+        assert resp.response_id == "chatcmpl-123"
+        assert resp.output_text == "Hello world!"
+        assert resp.function_calls == []
+        assert resp.status == "completed"
+        assert resp.usage.input_tokens == 15
+        assert resp.usage.output_tokens == 8
+        assert resp.usage.total_tokens == 23
+
+    def test_parses_chat_raw_tool_calls(self):
+        """from_chat_raw maps tool_calls[].function into FunctionCall objects."""
+        raw = {
+            "id": "chatcmpl-456",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_abc123",
+                                "type": "function",
+                                "function": {
+                                    "name": "calculator",
+                                    "arguments": '{"expression": "2+2"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 20},
+        }
+        resp = LLMResponse.from_raw(raw)
+        assert resp.response_id == "chatcmpl-456"
+        assert resp.output_text is None
+        assert len(resp.function_calls) == 1
+        fc = resp.function_calls[0]
+        assert fc.call_id == "call_abc123"
+        assert fc.name == "calculator"
+        assert fc.arguments_dict == {"expression": "2+2"}
+
+
+class TestChatCompletionsMessagesConversion:
+    """Test neutral input/Message → Chat Completions messages list."""
+
+    def test_to_chat_messages_string(self):
+        """String input + instructions → system and user messages."""
+        msgs = to_chat_messages("Berapa BBM?", instructions="Kamu agen riset")
+        assert len(msgs) == 2
+        assert msgs[0] == {"role": "system", "content": "Kamu agen riset"}
+        assert msgs[1] == {"role": "user", "content": "Berapa BBM?"}
+
+    def test_to_chat_messages_tool_output(self):
+        """function_call_output items converted to role='tool' and tool_call_id."""
+        items = [
+            {"type": "message", "role": "user", "content": "Query"},
+            {"type": "function_call_output", "call_id": "call_123", "output": '{"result": 4}'},
+        ]
+        msgs = to_chat_messages(items)
+        assert len(msgs) == 2
+        assert msgs[0] == {"role": "user", "content": "Query"}
+        assert msgs[1] == {
+            "role": "tool",
+            "tool_call_id": "call_123",
+            "content": '{"result": 4}',
+        }
+
+
+@pytest.mark.asyncio
+class TestChatCompletionsClientPayload:
+    """Test LLMClient behavior when configured with api_style='chat_completions'."""
+
+    async def test_chat_completions_endpoint_and_payload(self, respx_mock):
+        """Verify LLMClient posts to /chat/completions with messages payload."""
+        respx_mock.post("https://api.openai.com/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "chat-1",
+                    "choices": [{"message": {"content": "Response OK"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                },
+            )
+        )
+
+        client = LLMClient(
+            base_url="https://api.openai.com/v1",
+            api_key="sk-real-test-key",
+            model="deepseek-v4-pro",
+            api_style="chat_completions",
+        )
+        try:
+            resp = await client.respond("Halo", instructions="Sys prompt")
+            assert resp.output_text == "Response OK"
+            assert resp.usage.input_tokens == 10
+            assert resp.usage.output_tokens == 5
+
+            # Inspect payload sent
+            req = respx_mock.calls.last.request
+            assert req.url == "https://api.openai.com/v1/chat/completions"
+            body = json.loads(req.content)
+            assert body["model"] == "deepseek-v4-pro"
+            assert "messages" in body
+            assert body["messages"][0] == {"role": "system", "content": "Sys prompt"}
+            assert body["messages"][1] == {"role": "user", "content": "Halo"}
+            # Ensure unsupported fields store/previous_response_id/reasoning are omitted
+            assert "store" not in body
+            assert "previous_response_id" not in body
+            assert "reasoning" not in body
+        finally:
+            await client.aclose()
+
+
+@pytest.mark.live
+@pytest.mark.asyncio
+class TestLiveChatCompletions:
+    """Live test for Chat Completions API / 9Router integration."""
+
+    async def test_live_chat_completions_auth_failure(self):
+        """Intentionally bad key with api_style='chat_completions' → ErrorReport stage='auth'."""
+        client = LLMClient(
+            base_url="https://api.openai.com/v1",
+            api_key="sk-invalid-chat-key",
+            model="gpt-4o-mini",
+            api_style="chat_completions",
+        )
+        try:
+            with pytest.raises(LLMError) as exc_info:
+                await client.respond("ping")
+            err = exc_info.value
+            assert err.report.stage == "auth"
+            assert err.report.component == "llm"
+            assert err.report.http_status == 401
+        finally:
+            await client.aclose()
+

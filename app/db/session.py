@@ -28,25 +28,19 @@ async def init_engine(
     pool_size: int = 5,
     max_overflow: int = 10,
     echo: bool = False,
+    poolclass: Any | None = None,
 ) -> None:
-    """Initialize the async engine and session factory.
-
-    Args:
-        database_url:  PostgreSQL async URL (must use +asyncpg driver).
-        pool_size:     Number of persistent connections kept in the pool.
-        max_overflow:  Extra connections allowed beyond *pool_size*.
-        echo:          When ``True`` SQLAlchemy logs every SQL statement.
-                       Automatically set to ``True`` when ``LOG_LEVEL=DEBUG``.
-    """
+    """Initialize the async engine and session factory."""
     global _engine, _session_factory
 
-    _engine = create_async_engine(
-        database_url,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
-        pool_pre_ping=True,   # verify connection liveness before checkout
-        echo=echo,
-    )
+    kwargs: dict[str, Any] = {"echo": echo, "pool_pre_ping": True}
+    if poolclass is not None:
+        kwargs["poolclass"] = poolclass
+    else:
+        kwargs["pool_size"] = pool_size
+        kwargs["max_overflow"] = max_overflow
+
+    _engine = create_async_engine(database_url, **kwargs)
     _session_factory = async_sessionmaker(
         _engine,
         expire_on_commit=False,  # avoid lazy-load after commit in async context

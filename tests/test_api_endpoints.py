@@ -21,6 +21,9 @@ from app.db.models import Base, Conversation, Run, RunStep, ToolInvocation
 from app.main import app
 from app.schemas.agent import RunResult
 
+from app.db.session import close_engine, get_engine, init_engine
+from sqlalchemy.pool import NullPool
+
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+asyncpg://postgres:postgres@localhost:5432/rag_db",
@@ -28,32 +31,28 @@ DATABASE_URL = os.getenv(
 
 
 @pytest_asyncio.fixture(scope="function")
-async def async_db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Yield an AsyncSession that rolls back changes after the test."""
-    engine = create_async_engine(DATABASE_URL, echo=False)
+async def client() -> AsyncGenerator[AsyncClient, None]:
+    """Provide httpx AsyncClient with app.db.session engine initialized."""
+    engine = create_async_engine(DATABASE_URL, poolclass=NullPool, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
-    async with factory() as session, session.begin():
-        yield session
-        await session.rollback()
-
-    await engine.dispose()
-
-
-@pytest_asyncio.fixture(scope="function")
-async def client(async_db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
-    """Provide httpx AsyncClient with app.dependency_overrides for get_session."""
 
     async def _get_test_session() -> AsyncGenerator[AsyncSession, None]:
-        yield async_db_session
+        async with factory() as session:
+            try:
+                yield session
+            finally:
+                await session.rollback()
 
     app.dependency_overrides[get_session] = _get_test_session
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+
     app.dependency_overrides.clear()
+    await engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +184,6 @@ async def test_post_agent_query_stream_sse(
 @pytest.mark.asyncio
 async def test_runs_endpoints(
     client: AsyncClient,
-    async_db_session: AsyncSession,
 ) -> None:
     """Test GET /v1/runs, GET /v1/runs/{id}, /v1/runs/{id}/trace, /v1/runs/{id}/tools."""
     conv_id = uuid.uuid4()
@@ -231,22 +229,29 @@ async def test_runs_endpoints(
         credits_used=5,
     )
 
-    async_db_session.add_all([conv, run, step1, step2, tool_inv])
-    await async_db_session.flush()
+    seed_engine = create_async_engine(DATABASE_URL, poolclass=NullPool, echo=False)
+    factory = async_sessionmaker(seed_engine, expire_on_commit=False, autoflush=False)
+    async with factory() as session:
+        session.add_all([conv, run, step1, step2, tool_inv])
+        await session.commit()
+    await seed_engine.dispose()
 
     # 1. List runs
     res = await client.get("/v1/runs")
+    print("--- STEP 1 DONE ---")
     assert res.status_code == 200
     runs_list = res.json()
     assert any(r["id"] == str(run_id) for r in runs_list)
 
     # 2. Get run by ID
     res_get = await client.get(f"/v1/runs/{run_id}")
+    print("--- STEP 2 DONE ---")
     assert res_get.status_code == 200
     assert res_get.json()["id"] == str(run_id)
 
     # 3. Get run trace (JSON)
     res_trace = await client.get(f"/v1/runs/{run_id}/trace")
+    print("--- STEP 3 DONE ---")
     assert res_trace.status_code == 200
     trace_events = res_trace.json()
     assert len(trace_events) == 2
@@ -255,12 +260,14 @@ async def test_runs_endpoints(
 
     # 4. Get run trace (text format)
     res_trace_text = await client.get(f"/v1/runs/{run_id}/trace?format=text")
+    print("--- STEP 4 DONE ---")
     assert res_trace_text.status_code == 200
     assert "text/plain" in res_trace_text.headers["content-type"]
     assert "run_start" in res_trace_text.text
 
     # 5. Get run tools
     res_tools = await client.get(f"/v1/runs/{run_id}/tools")
+    print("--- STEP 5 DONE ---")
     assert res_tools.status_code == 200
     tools_invs = res_tools.json()
     assert len(tools_invs) == 1
@@ -287,13 +294,16 @@ async def test_run_not_found(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_conversations_endpoints(
     client: AsyncClient,
-    async_db_session: AsyncSession,
 ) -> None:
     """Test GET /v1/conversations and GET /v1/conversations/{id}."""
     conv_id = uuid.uuid4()
     conv = Conversation(id=conv_id, title="Test Conversation Title")
-    async_db_session.add(conv)
-    await async_db_session.flush()
+    seed_engine = create_async_engine(DATABASE_URL, poolclass=NullPool, echo=False)
+    factory = async_sessionmaker(seed_engine, expire_on_commit=False, autoflush=False)
+    async with factory() as session:
+        session.add(conv)
+        await session.commit()
+    await seed_engine.dispose()
 
     res_list = await client.get("/v1/conversations")
     assert res_list.status_code == 200

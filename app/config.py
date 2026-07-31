@@ -44,8 +44,9 @@ class Settings(BaseSettings):
         return v
 
     # ---------------------------------------------------------------------------
-    # LLM (OpenAI Responses API — POST {LLM_BASE_URL}/responses)
+    # LLM (Responses API vs Chat Completions API — POST {LLM_BASE_URL}/...)
     # ---------------------------------------------------------------------------
+    LLM_API_STYLE: Literal["responses", "chat_completions"] = "responses"
     LLM_BASE_URL: str = "https://api.openai.com/v1"
     LLM_API_KEY: str = "sk-xxx"
     LLM_MODEL: str = "gpt-4o-mini"
