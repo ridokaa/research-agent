@@ -133,17 +133,22 @@ async def test_rate_limit_per_ip():
     try:
         from app.config import get_settings
         settings = get_settings()
+        orig_limit = settings.RATE_LIMIT_PER_MINUTE
+        settings.RATE_LIMIT_PER_MINUTE = 5
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-            for i in range(settings.RATE_LIMIT_PER_MINUTE):
-                resp = await ac.post("/v1/agent/query", json={"query": "test query"})
-                assert resp.status_code != 429
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                for i in range(5):
+                    resp = await ac.post("/v1/agent/query", json={"query": "test query"})
+                    assert resp.status_code != 429
 
-            exceeded_resp = await ac.post("/v1/agent/query", json={"query": "test query"})
-            assert exceeded_resp.status_code == 429
-            data = exceeded_resp.json()
-            assert data["error"]["code"] == 429
-            assert "Rate limit exceeded" in data["error"]["message"]
+                exceeded_resp = await ac.post("/v1/agent/query", json={"query": "test query"})
+                assert exceeded_resp.status_code == 429
+                data = exceeded_resp.json()
+                assert data["error"]["code"] == 429
+                assert "Rate limit exceeded" in data["error"]["message"]
+        finally:
+            settings.RATE_LIMIT_PER_MINUTE = orig_limit
     finally:
         app.dependency_overrides.clear()
         await engine.dispose()
