@@ -15,7 +15,7 @@ Jangan lompat tahap — tiap prompt mengasumsikan hasil prompt sebelumnya sudah 
 | Aspek | Keputusan |
 |---|---|
 | Backend | Python 3.11+, FastAPI (async) |
-| LLM | OpenAI **Responses API** — `POST https://api.openai.com/v1/responses` (stateful, tool-native) |
+| LLM | OpenAI-compatible, dua gaya via `LLM_API_STYLE`: **Responses API** (`/responses`, OpenAI/HF gpt-oss) atau **Chat Completions** (`/chat/completions`, 9Router→deepseek-v4-pro dll). Client menyerap perbedaannya; loop tetap style-agnostic |
 | DB | PostgreSQL — `postgresql://postgres:postgres@localhost:5432/rag_db` (Docker) |
 | Data source eksternal | Verosight (REST API + MCP server) |
 | Tool system | Modular — tambah tool baru = 1 file + 1 decorator, tanpa sentuh core loop |
@@ -216,15 +216,21 @@ LOG_FILE=./logs/agent.jsonl
 # Database
 DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/rag_db
 
-# LLM (OpenAI Responses API — POST {LLM_BASE_URL}/responses)
+# LLM (dua gaya, dipilih LLM_API_STYLE — lihat PROMPT 3)
+LLM_API_STYLE=responses     # responses → {BASE}/responses (OpenAI/HF gpt-oss)
+                            # chat_completions → {BASE}/chat/completions (9Router dll)
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_API_KEY=sk-xxx
 LLM_MODEL=gpt-4o-mini
 LLM_TEMPERATURE=0.2
 LLM_MAX_OUTPUT_TOKENS=2048
 LLM_TIMEOUT_S=60
-LLM_STORE=true              # simpan state di server OpenAI → pakai previous_response_id
-LLM_REASONING_EFFORT=       # isi (low/medium/high) hanya untuk model reasoning; kosongkan bila tidak
+LLM_STORE=true              # gaya responses saja: state server → previous_response_id
+LLM_REASONING_EFFORT=       # gaya responses saja (low/medium/high); diabaikan di chat_completions
+# Contoh 9Router / deepseek-v4-pro:
+#   LLM_API_STYLE=chat_completions
+#   LLM_BASE_URL=https://9router.fhs.my.id/v1
+#   LLM_MODEL=xkiro/deepseek/deepseek-v4-pro
 
 # Agent loop
 AGENT_MAX_ITERATIONS=8
@@ -402,68 +408,101 @@ dan bahwa flush() menulis semua event ke run_steps.
 
 ---
 
-### PROMPT 3 — LLM client (OpenAI Responses API)
+### PROMPT 3 — LLM client (dua gaya: Responses API + Chat Completions)
 
 ```text
-Implementasikan app/llm/client.py: async client untuk OpenAI Responses API
-(POST {LLM_BASE_URL}/responses). PENTING: ini BUKAN chat/completions. Formatnya
-berbeda dan tidak boleh dicampur — memakai definisi tool gaya chat completions
-di endpoint /responses adalah penyebab error "invalid parameter" paling umum.
+Implementasikan app/llm/client.py: async client OpenAI-compatible yang mendukung
+DUA gaya API di balik satu abstraksi, dipilih lewat config LLM_API_STYLE:
+  - "responses"        → POST {LLM_BASE_URL}/responses      (OpenAI langsung)
+  - "chat_completions" → POST {LLM_BASE_URL}/chat/completions (gateway seperti
+                         9Router → deepseek-v4-pro, dan mayoritas provider lain)
+Default "responses". Kedua gaya WAJIB menghasilkan LLMResponse yang identik,
+sehingga loop, planner, tool, dan state TIDAK perlu tahu gaya mana yang dipakai.
 
-Perbedaan kunci Responses API yang wajib dipatuhi:
-- Request memakai `input` (bukan `messages`) + `instructions` (untuk system prompt).
-  `input` boleh string atau array of items.
-- Definisi tool FLAT — tidak ada nested "function":
-  {"type":"function","name":"...","description":"...","parameters":{...JSON Schema...}}
-- Model mengembalikan tool call sebagai item top-level di `response.output` dengan
-  type="function_call", berisi call_id, name, arguments (string JSON).
-- Hasil tool dikirim balik sebagai item {"type":"function_call_output",
-  "call_id":"...","output":"...string..."}.
-- State server-side: kirim `previous_response_id` + `store=true` supaya tidak perlu
-  mengirim ulang seluruh riwayat pada iterasi berikutnya.
-- Usage memakai input_tokens / output_tokens (bukan prompt/completion_tokens).
-- JSON mode via text.format = {"type":"json_object"} (bukan response_format).
+ATURAN ARSITEKTUR (paling penting): seluruh perbedaan gaya diserap HANYA di
+app/llm/. Tidak boleh ada percabangan `if style == ...` di app/agent/ atau di mana
+pun di luar client. Loop/planner menyusun daftar Message NETRAL (role, content,
+tool_call_id, tool_name); client yang menerjemahkannya ke format kabel per-gaya.
+
+── Perbedaan kedua gaya yang harus diserap client ──────────────────────────────
+                     | responses                    | chat_completions
+Field request        | input + instructions         | messages (role/content)
+System prompt        | instructions                 | pesan role="system"
+Definisi tool        | FLAT: {"type":"function",    | NESTED: {"type":"function",
+                     |  "name","description",       |  "function":{"name",
+                     |  "parameters"}               |  "description","parameters"}}
+Tool call di respons | output[] item                | choices[0].message.tool_calls[]
+                     |  type="function_call"        |  {id, function:{name,arguments}}
+                     |  (call_id,name,arguments)    |
+Teks jawaban         | output[] item type="message" | choices[0].message.content
+Umpan balik hasil    | input item                   | pesan {"role":"tool",
+tool                 |  {"type":"function_call_     |  "tool_call_id":...,
+                     |   output","call_id","output"}|  "content":...}
+State antar-iterasi  | previous_response_id + store | TIDAK ada; kirim ulang
+                     |                              |  seluruh messages (dari state)
+Usage                | input_tokens/output_tokens   | prompt_tokens/completion_tokens
+reasoning effort     | reasoning={"effort":...}     | tidak didukung → JANGAN kirim
+JSON mode            | text.format={"type":...}     | response_format={"type":...}
+────────────────────────────────────────────────────────────────────────────────
 
 Requirement:
-- Class LLMClient(base_url, api_key, model, timeout, store) memakai httpx.AsyncClient.
-- Method utama:
-  async respond(input, instructions=None, tools=None, tool_choice="auto",
-                previous_response_id=None, temperature=None,
-                max_output_tokens=None, text_format=None) -> LLMResponse
-- LLMResponse berisi: response_id, output_text (str|None),
-  function_calls (list[FunctionCall{call_id,name,arguments_dict}]),
-  status/incomplete_reason, usage(input_tokens, output_tokens), raw.
-  Parse `response.output`: pisahkan item type="message" (ambil teksnya) dari
-  type="function_call". Arguments di-json.loads dengan guard bila string invalid.
-- Helper: build_function_tool(spec) → dict flat; to_function_call_output(call_id,
-  result_text) → item input untuk iterasi berikutnya.
-- Retry dengan tenacity: 3x exponential backoff untuk 429/500/502/503/timeout,
-  TIDAK retry untuk 400/401.
+- Class LLMClient(base_url, api_key, model, timeout, api_style, store) pakai
+  httpx.AsyncClient. api_style menentukan endpoint + serialisasi + parsing.
+- Method publik tunggal & style-agnostic:
+    async respond(messages, instructions=None, tools=None, tool_choice="auto",
+                  previous_response_id=None, temperature=None,
+                  max_output_tokens=None, reasoning_effort=None,
+                  json_mode=False) -> LLMResponse
+  `messages` = list[Message] NETRAL. Untuk gaya responses, instructions dipetakan
+  ke field instructions; untuk gaya chat, instructions diselipkan sebagai pesan
+  system paling depan.
+- LLMResponse (SAMA untuk kedua gaya): response_id (None di gaya chat),
+  content (str|None), tool_calls (list[ToolCall{id, name, arguments_dict}]),
+  finish_reason, usage(input_tokens, output_tokens  ← dinormalkan dari kedua
+  penamaan), raw.
+- Serializer terpisah, dipilih sesuai gaya:
+    to_responses_tools(specs)  → list dict FLAT
+    to_chat_tools(specs)       → list dict NESTED (pembungkus "function")
+    to_responses_input(msgs)   → items (termasuk function_call_output)
+    to_chat_messages(msgs)     → messages (termasuk {"role":"tool",...})
+  Registry (PROMPT 4) menyediakan keduanya; client memanggil yang sesuai.
+- Parser terpisah → LLMResponse yang sama:
+    gaya responses: pisahkan output[] type="message" (teks) vs "function_call".
+    gaya chat: baca choices[0].message.content + tool_calls[].function
+    (arguments di-json.loads dengan guard bila string invalid).
+- reasoning_effort & previous_response_id hanya berlaku gaya responses. Di gaya
+  chat keduanya diabaikan diam-diam (jangan kirim field yang tak didukung).
+- Retry tenacity: 3x exponential backoff untuk 429/500/502/503/timeout, TIDAK
+  retry untuk 400/401. Berlaku sama untuk kedua endpoint.
 - Setiap panggilan memancarkan trace event llm_request & llm_response lewat
-  RunTracer yang di-inject (opsional, boleh None). Simpan response_id di trace
-  supaya rantai previous_response_id bisa ditelusuri.
-- TANPA mode mock (lihat aturan global 1.6). Tidak ada app/llm/mock.py, tidak ada
-  fixture skrip. Client selalu memanggil Responses API asli.
-- Laporan error (aturan 1.6): bila panggilan gagal, kembalikan/raise dengan
-  ErrorReport(component="llm", stage=...) yang menyebut tahap: "missing_api_key"
-  (key kosong → gagal eksplisit, JANGAN diam), "auth" (401), "rate_limited" (429),
-  "http_request" (koneksi/timeout), "response_parse" (2xx tapi struktur output tak
-  terduga), "server_error" (5xx). Sertakan http_status dan response id bila ada.
-- Guard konteks: bila store=false (tidak pakai previous_response_id), sediakan
-  compact_input() yang meringkas item lama (sisakan instruksi + N item terakhir
-  + ringkasan). Sediakan hook-nya sekarang; implementasi boleh sederhana.
+  RunTracer (opsional, boleh None). Rekam api_style + model + response_id (bila
+  ada) di trace supaya rantai iterasi bisa ditelusuri.
+- TANPA mode mock (aturan global 1.6). Tidak ada app/llm/mock.py, tidak ada
+  fixture skrip. Client selalu memanggil endpoint asli sesuai gaya.
+- Laporan error (aturan 1.6): bila gagal, hasilkan ErrorReport(component="llm",
+  stage=...) — "missing_api_key" (key kosong → gagal eksplisit, JANGAN diam),
+  "auth" (401), "rate_limited" (429), "http_request" (koneksi/timeout),
+  "response_parse" (2xx tapi struktur tak terduga — sering terjadi bila gateway
+  mengembalikan tool call sebagai teks biasa, bukan tool_calls), "server_error"
+  (5xx). Sertakan http_status, endpoint, dan response id bila ada.
+- Guard konteks (dipakai gaya chat & gaya responses saat store=false): sediakan
+  compact_history() yang meringkas Message lama (sisakan instruksi + N pesan
+  terakhir + ringkasan). Hook sekarang, implementasi boleh sederhana.
 
 Definition of Done (tanpa mock — lihat 1.6):
-- Test logika murni (tanpa jaringan): (a) definisi tool ter-serialisasi FLAT
-  (tidak ada key "function" bersarang), (b) fungsi yang membentuk
-  function_call_output dari hasil tool menghasilkan struktur benar, (c) parser
-  response.output memetakan item function_call & output_text dengan benar bila
-  diberi objek response contoh yang dibangun langsung dalam test (bukan HTTP-mock).
-- Test live (marker `live`, butuh LLM_API_KEY asli): satu panggilan nyata
-  mengembalikan LLMResponse ter-parse; panggilan dengan key sengaja salah
-  menghasilkan ErrorReport(stage="auth"); key kosong → ErrorReport(stage=
-  "missing_api_key"). Retry 429 diverifikasi lewat konfigurasi tenacity (unit,
-  tanpa memalsukan respons).
+- Test logika murni (tanpa jaringan), untuk KEDUA gaya:
+  (a) to_responses_tools() FLAT & to_chat_tools() NESTED ter-serialisasi benar;
+  (b) konversi Message netral → input responses (function_call_output) dan →
+      messages chat ({"role":"tool","tool_call_id":...}) menempatkan id dengan benar;
+  (c) parser kedua gaya memetakan objek respons contoh (dibangun langsung dalam
+      test, bukan HTTP-mock) ke LLMResponse yang setara — content & tool_calls sama.
+- Test live (marker `live`):
+  gaya chat_completions (butuh key 9Router asli): satu panggilan sukses ter-parse;
+    satu round-trip tool call (model minta tool → hasil diumpankan balik via pesan
+    role="tool" → jawaban final); key salah → ErrorReport(stage="auth").
+  gaya responses (butuh OPENAI/HF key asli, skip bila tak ada): satu panggilan
+    sukses ter-parse.
+- Regresi: jalur responses tetap berperilaku seperti sebelum retrofit.
 ```
 
 ---
@@ -481,10 +520,14 @@ di app/tools/ tanpa mengubah satu baris pun di app/agent/.
      dari model pydantic (jadi definisi argumen cukup ditulis sekali).
 
 2. app/tools/registry.py:
-   - ToolRegistry: register(tool), get(name), list_specs(tags=None),
-     to_responses_tools() -> list[dict]. Output HARUS format flat Responses API:
-     {"type":"function","name":..,"description":..,"parameters":{..JSON Schema..}}
-     — TANPA nested "function". (Jangan pakai format chat/completions.)
+   - ToolRegistry: register(tool), get(name), list_specs(tags=None), DUA serializer
+     (dipakai client sesuai LLM_API_STYLE — lihat PROMPT 3):
+       to_responses_tools() -> list[dict] — format FLAT Responses API:
+         {"type":"function","name":..,"description":..,"parameters":{..JSON Schema..}}
+         TANPA nested "function".
+       to_chat_tools() -> list[dict] — format NESTED Chat Completions:
+         {"type":"function","function":{"name":..,"description":..,"parameters":{..}}}
+     Keduanya dibangun dari sumber schema yang SAMA (jangan duplikasi definisi).
    - Decorator @register_tool untuk fungsi sederhana:
 
      @register_tool(name="calculator", description="...", cost_credits=0)
@@ -684,20 +727,23 @@ Implementasikan app/agent/loop.py — AgentLoop.
 Signature: async def run(user_query: str, conversation_id: UUID | None,
                          options: RunOptions) -> RunResult
 
-Alur per iterasi (Responses API):
-1. planner.build_request(state) → instructions (system prompt terisi) + input.
-   Pada iterasi pertama input = pertanyaan user (+ execution memory block bila ada).
-   Pada iterasi lanjutan, bila store=true cukup kirim item baru + previous_response_id;
-   bila store=false kirim input yang sudah dipadatkan.
-2. llm.respond(input, instructions=..., tools=registry.to_responses_tools(),
-   previous_response_id=state.last_response_id). Simpan response_id ke state.
-3. Jika response.function_calls tidak kosong:
+Alur per iterasi (STYLE-AGNOSTIC — loop tidak tahu Responses vs Chat Completions;
+client yang menyerap perbedaan, lihat PROMPT 3):
+1. planner.build_request(state) → instructions (system prompt terisi) + daftar
+   Message NETRAL. Iterasi pertama: pesan user (+ execution memory block bila ada).
+   Iterasi lanjutan: tambahkan pesan assistant + hasil tool sebagai Message netral.
+   (Client memutuskan sendiri: gaya responses boleh pakai previous_response_id bila
+   store=true; gaya chat mengirim ulang seluruh messages. Loop tidak mengurusnya.)
+2. llm.respond(messages, instructions=..., tools=registry (client memilih
+   to_responses_tools()/to_chat_tools() sesuai gaya), previous_response_id=
+   state.last_response_id). Simpan response_id (bila ada) ke state.
+3. Jika response.tool_calls tidak kosong:
      - trace "tool_selected" (daftar nama + argumen)
      - executor.execute untuk semua tool (paralel bila diizinkan)
-     - untuk tiap hasil, bentuk item function_call_output (call_id + output ringkas),
-       kumpulkan sebagai input iterasi berikutnya; tulis juga ke execution memory
+     - untuk tiap hasil, tambahkan Message netral hasil tool (tool_call_id + output
+       ringkas) ke riwayat; tulis juga ke execution memory
      - iteration += 1, lanjut loop
-4. Jika response.output_text ada dan function_calls kosong:
+4. Jika response.content ada dan tool_calls kosong:
      - jalankan self-check: panggil LLM sekali dengan prompts/finalize.md
        yang menanyakan apakah jawaban sudah didukung data yang diperoleh
        (jawab JSON: {"is_final": bool, "reason": str, "missing": str|null}).
@@ -978,7 +1024,8 @@ yang belum terjawab, atau data yang ada bertentangan.
 - [ ] `python scripts/simulate.py scenarios` (dengan key terisi) → semua skenario live jalan pakai LLM & tool asli
 - [ ] Setiap error (LLM/Verosight/MCP/DB) muncul sebagai `ErrorReport` dengan `component` + `stage` di trace & response
 - [ ] API key kosong → proses gagal eksplisit dengan pesan jelas, BUKAN diam-diam memakai data tiruan
-- [ ] Client LLM memakai Responses API: tool ter-serialisasi flat, `previous_response_id` terpakai antar-iterasi
+- [ ] Client LLM dua gaya (`LLM_API_STYLE`): `responses` (tool flat) & `chat_completions` (tool nested) sama-sama menghasilkan LLMResponse setara; loop tetap style-agnostic
+- [ ] Gaya `chat_completions` diuji live ke 9Router/deepseek-v4-pro: round-trip tool call jalan (tool_calls ter-parse, bukan jatuh sebagai teks)
 
 ---
 
