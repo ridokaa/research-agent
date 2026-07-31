@@ -29,6 +29,7 @@ Error taxonomy (§1.6 PROMPT_PLAN, PROMPT 3):
 """
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Literal
 
@@ -457,7 +458,18 @@ class LLMClient:
                         body=exc.response.text[:500],
                     )
                 raise  # tenacity checks _is_retryable
-            return resp.json()
+
+            text = resp.text.strip()
+            if "data: [DONE]" in text:
+                text = text.split("data: [DONE]")[0].strip()
+
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                if "{" in text and "}" in text:
+                    first_json = text[text.find("{") : text.rfind("}") + 1]
+                    return json.loads(first_json)
+                return resp.json()
 
         return await _inner()
 

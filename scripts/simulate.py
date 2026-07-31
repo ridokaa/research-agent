@@ -100,13 +100,15 @@ def ask(
         if tracer and hasattr(tracer, "_buffer"):
             console.print("\n[bold cyan]--- Real-time Run Trace Events ---[/bold cyan]")
             for ev in tracer._buffer:
-                tag = f"[{ev.event_type.upper()}]"
-                color = "green" if "start" in ev.event_type or "end" in ev.event_type else "cyan"
-                if "error" in ev.event_type:
+                ev_type = getattr(ev, "type", getattr(ev, "event_type", ""))
+                tag = f"[{str(ev_type).upper()}]"
+                color = "green" if "start" in str(ev_type) or "end" in str(ev_type) else "cyan"
+                if "error" in str(ev_type):
                     color = "red"
-                elif "tool" in ev.event_type:
+                elif "tool" in str(ev_type):
                     color = "yellow"
-                console.print(f"  [bold {color}]{tag:<16}[/bold {color}] {ev.message}")
+                msg = getattr(ev, "summary", str(getattr(ev, "payload", "")))
+                console.print(f"  [bold {color}]{tag:<16}[/bold {color}] {msg}")
 
         console.print("\n" + "=" * 80)
         console.print(Panel(f"[bold green]Final Answer:[/bold green]\n{res.answer}", title=f"Result (Status: {res.status})"))
