@@ -477,6 +477,71 @@ class TestBuildPayload:
         )
         assert "reasoning" not in payload
 
+    def test_temperature_and_max_output_tokens_plumbing(self):
+        client = LLMClient(
+            base_url=BASE_URL,
+            api_key="sk-test",
+            model="gpt-4o-mini",
+            temperature=0.2,
+            max_output_tokens=4096,
+        )
+        payload = client._build_payload(
+            input="hi",
+            instructions=None,
+            tools=None,
+            tool_choice="auto",
+            previous_response_id=None,
+            temperature=0.2,
+            max_output_tokens=4096,
+            text_format=None,
+        )
+        assert payload["temperature"] == 0.2
+        assert payload["max_output_tokens"] == 4096
+
+    def test_reasoning_model_temperature_guard(self):
+        client = LLMClient(
+            base_url=BASE_URL,
+            api_key="sk-test",
+            model="o1-mini",
+            temperature=0.2,
+            max_output_tokens=4096,
+        )
+        payload = client._build_payload(
+            input="hi",
+            instructions=None,
+            tools=None,
+            tool_choice="auto",
+            previous_response_id=None,
+            temperature=0.2,
+            max_output_tokens=4096,
+            text_format=None,
+        )
+        assert "temperature" not in payload
+        assert payload["max_output_tokens"] == 4096
+
+    def test_chat_completions_max_tokens_mapping(self):
+        client = LLMClient(
+            base_url=BASE_URL,
+            api_key="sk-test",
+            model="gpt-4o-mini",
+            api_style="chat_completions",
+            temperature=0.2,
+            max_output_tokens=4096,
+        )
+        payload = client._build_payload(
+            input="hi",
+            instructions=None,
+            tools=None,
+            tool_choice="auto",
+            previous_response_id=None,
+            temperature=0.2,
+            max_output_tokens=4096,
+            text_format=None,
+        )
+        assert payload["temperature"] == 0.2
+        assert payload["max_tokens"] == 4096
+        assert "max_output_tokens" not in payload
+
 
 # ---------------------------------------------------------------------------
 # (f) _is_retryable helper — PURE LOGIC

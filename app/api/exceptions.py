@@ -61,9 +61,16 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
     """Handle unexpected server exceptions."""
     req_id = _get_request_id(request)
     logger.exception("unhandled.exception", error=str(exc), request_id=req_id)
+    
+    from app.config import get_settings
+    settings = get_settings()
+    message = "An unexpected server error occurred."
+    if settings.APP_ENV == "local":
+        message = f"An unexpected server error occurred: {type(exc).__name__}: {exc}"
+
     return _format_error_response(
         code="INTERNAL_SERVER_ERROR",
-        message="An unexpected server error occurred.",
+        message=message,
         request_id=req_id,
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
     )

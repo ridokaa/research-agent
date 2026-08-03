@@ -225,18 +225,23 @@ LLM_MODEL=gpt-4o-mini
 LLM_TEMPERATURE=0.2
 LLM_MAX_OUTPUT_TOKENS=2048
 LLM_TIMEOUT_S=60
-LLM_STORE=true              # gaya responses saja: state server → previous_response_id
+LLM_STORE=true              # gaya responses: state server → previous_response_id.
+                            # WAJIB false untuk chat_completions (tak ada state server;
+                            # riwayat dikirim ulang) — lihat §6 Changelog.
 LLM_REASONING_EFFORT=       # gaya responses saja (low/medium/high); diabaikan di chat_completions
-# Contoh 9Router / deepseek-v4-pro:
+# Contoh 9Router / deepseek-v4-pro (konfigurasi AKTIF saat ini — lihat §6):
 #   LLM_API_STYLE=chat_completions
 #   LLM_BASE_URL=https://9router.fhs.my.id/v1
 #   LLM_MODEL=xkiro/deepseek/deepseek-v4-pro
+#   LLM_STORE=false
 
 # Agent loop
 AGENT_MAX_ITERATIONS=8
 AGENT_RUN_TIMEOUT_S=180
 AGENT_CREDITS_BUDGET=100
 AGENT_PARALLEL_TOOLS=true
+TOOL_RESULT_PASSTHROUGH=true   # true → hasil tool/MCP diteruskan UTUH (tanpa truncate/limit
+                               # sisi aplikasi). false → aktifkan _truncate_result. Lihat §6.
 
 # Verosight
 VEROSIGHT_API_BASE=https://api.verosight.com
@@ -1055,3 +1060,107 @@ ketiga jalur itu sekaligus.
 **Batas konteks.** Hasil tool Verosight bisa sangat besar (500 post). Ringkas
 di sisi tool, bukan di sisi prompt — simpan penuh ke `tool_invocations.result`
 supaya trace tetap lengkap sementara konteks LLM tetap ramping.
+> Catatan pembaruan: kini ada flag `TOOL_RESULT_PASSTHROUGH` (default `true`) yang
+> **mem-bypass** ringkasan/truncation sisi aplikasi agar seluruh data diteruskan
+> utuh. Lihat §6.4. Bila token/biaya jadi masalah, set `false` atau batasi lewat
+> parameter Tool/API sumbernya (mis. `limit`/`cursor` Verosight), bukan memangkas di aplikasi.
+
+---
+
+## 6. Status Implementasi & Changelog (per 2026-08-03)
+
+> Bagian ini mencatat **penyimpangan dan perubahan nyata** terhadap rencana di atas,
+> berdasarkan audit kode/konfigurasi branch `retrofit/chat-completions-adapter`.
+> Prompt bertahap (§2) tetap valid sebagai panduan bangun; bagian ini adalah sumber
+> kebenaran untuk "apa yang sudah berubah". Dokumen rinci per topik ada di `docs/`.
+
+### 6.1 Konfigurasi LLM aktif — deepseek-v4-pro via 9Router
+
+Konfigurasi LLM aktif **bukan lagi OpenAI**, melainkan gaya `chat_completions`:
+
+| Variabel | Nilai aktif |
+|---|---|
+| `LLM_API_STYLE` | `chat_completions` |
+| `LLM_BASE_URL` | `https://9router.fhs.my.id/v1` |
+| `LLM_MODEL` | `xkiro/deepseek/deepseek-v4-pro` |
+| `LLM_STORE` | `false` (WAJIB untuk chat — tak ada state server) |
+| `LLM_MAX_OUTPUT_TOKENS` | `4096` (diturunkan dari nilai lama) |
+| `VEROSIGHT_MODE` | `mcp` (metadata resmi dari `list_tools()`) |
+
+Riwayat singkat: gpt-4o-mini → gpt-4o → **deepseek-v4-pro**. Alasan pindah dari
+gpt-4o: pemilihan tool lemah pada gpt-4o-mini, lalu 429 rate-limit pada gpt-4o di
+tier rendah. Detail: `docs/Plan-perubahan-model.md`, `docs/plan-percobaan-model-berbeda.md`,
+`docs/plan-switch-deepseek-9router.md`.
+
+### 6.2 Client LLM dua-gaya (PROMPT 3) — TERIMPLEMENTASI
+
+- `app/llm/client.py` + `app/llm/schemas.py`: satu abstraksi `LLMClient` menyerap gaya
+  `responses` (FLAT tools, `input`/`instructions`, `previous_response_id`) dan
+  `chat_completions` (NESTED tools, `messages`, kirim ulang riwayat).
+- `app/tools/registry.py`: `to_responses_tools()` (flat) & `to_chat_tools()` (nested)
+  dibangun dari **`ToolSpec` yang sama** → metadata (nama/deskripsi/schema) identik lintas
+  gaya; hanya pembungkus JSON yang berbeda. `to_tools(api_style=...)` memilih otomatis.
+- **Implikasi penting:** peralihan model **tidak** menulis ulang metadata Verosight.
+  Metadata resmi MCP dipakai apa adanya. Lihat `docs/plan-perubahan-cara-kerja.md`.
+
+### 6.3 Metadata Verosight resmi (bukan manual)
+
+- Mode `mcp`: `app/mcp/adapter.py::mcp_tool_to_spec` mengisi `ToolSpec` dari
+  `list_tools()` resmi Verosight (~20 tool, prefiks `verosight__`). Deskripsi/schema
+  tidak ditulis tangan.
+- `app/mcp/client.py`: transport retry untuk 404 "session not found" saat init SSE
+  (propagasi sesi Verosight) — muncul sebagai `warning` startup yang normal & ter-retry.
+
+### 6.4 Pass-through hasil tool/MCP — TERIMPLEMENTASI (flag)
+
+- `app/config.py`: `TOOL_RESULT_PASSTHROUGH: bool = True`.
+- `app/tools/executor.py`: `_truncate_result()` hanya dijalankan **jika passthrough=false**.
+  Dengan default `true`, hasil Tool/MCP diteruskan **utuh** (tanpa truncate/limit sisi
+  aplikasi) — memenuhi kebutuhan "teruskan seluruh data". Data penuh tetap tersimpan ke
+  `tool_invocations.result`. Ini **melonggarkan** panduan "Batas konteks" §5 — trade-off
+  token/biaya vs kelengkapan, dikendalikan lewat flag. Detail: `docs/plan-perubahan-cara-kerja.md`.
+- Sebagian summarizer `app/tools/verosight/helpers.py` disesuaikan agar tidak memangkas
+  isi bermakna.
+
+### 6.5 Transparansi error & perbaikan 500 — TERIMPLEMENTASI
+
+- `app/agent/loop.py`: blok utama kini punya `except Exception` → kegagalan run menjadi
+  `RunResult(status="failed")` + `ErrorReport(component="api", stage="execution")`,
+  **bukan** HTTP 500 tersamar. (Akar & rencana: `docs/plan-fix-500-agent-query.md`.)
+- `app/api/exceptions.py`: pada `APP_ENV=local`, pesan 500 memuat tipe + detail exception
+  (memudahkan debug lewat Postman).
+- `app/tools/executor.py` — **fix `CancelledError` (2026-08-03):** timeout `asyncio.wait_for`
+  di sekitar panggilan MCP bisa bocor sebagai `asyncio.CancelledError` (BaseException) dari
+  batas anyio SDK MCP, lolos semua handler `except Exception`, dan menjatuhkan request jadi
+  `RuntimeError: No response returned` → 500. Sekarang ditangkap dan dikonversi menjadi
+  `ToolResult(status="timeout")` (dengan guard: tetap `raise` bila task dibatalkan dari luar
+  seperti shutdown/disconnect). Terverifikasi: unit test deterministik + end-to-end server 200.
+
+### 6.6 Penyaringan per-lokasi (system prompt) — TERIMPLEMENTASI
+
+- `app/agent/prompts/system.md` menambah blok **"Panduan memakai tool pencarian"**: wajib
+  mengekstrak lokasi/keyword dari pertanyaan dan meneruskannya ke tool; utamakan
+  `semantic_search`/`search_posts` untuk permintaan "X di <lokasi>". Detail:
+  `docs/plan-percobaan-model-berbeda.md` (Tahap B).
+
+### 6.7 Batasan yang terkonfirmasi (bukan bug)
+
+- **Tidak ada filter negara keras** pada tool Verosight; penyaringan "Indonesia" bersifat
+  keyword/semantik → hasil "cukup sesuai", bukan pagar geografis. Verosight = data **sosial**,
+  bukan sumber cuaca/fakta real-time.
+- **Rate limit LLM (429)** bergantung provider/tier (khusus gpt-4o tier rendah); 9Router
+  umumnya lebih longgar.
+- **`credits_budget`** adalah pagar internal (proxy biaya Verosight nyata) — bisa dinaikkan
+  per-request, tetapi sebaiknya tidak dihapus (melindungi saldo Verosight; ada diminishing return).
+
+### 6.8 Dokumen rencana terkait (di `docs/`)
+
+- `Plan-perubahan-model.md` — sinkronisasi konfigurasi model OpenAI.
+- `plan-perubahan-cara-kerja.md` — metadata resmi Verosight → Responses API + pass-through.
+- `plan-postman.md` — Postman Collection v2.1 & Environment.
+- `plan-fix-500-agent-query.md` — akar & perbaikan 500 (loop tanpa `except`).
+- `plan-percobaan-model-berbeda.md` — uji model & penyaringan lokasi.
+- `plan-switch-deepseek-9router.md` — peralihan ke deepseek-v4-pro via 9Router.
+
+> Catatan: perubahan kode di atas **belum di-commit** (branch `retrofit/chat-completions-adapter`).
+> `.env` berisi kredensial nyata dan **tidak** di-track git.

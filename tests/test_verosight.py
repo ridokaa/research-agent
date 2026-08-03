@@ -31,8 +31,11 @@ def _reset_reg():
 # Pure Logic Tests (No Network / No HTTP Mocks)
 # ===========================================================================
 
-def test_summarize_verosight_response_truncates_sample_and_removes_empty_media_urls():
-    """Verify that summarize_verosight_response truncates sample_* to <= 5 items and strips empty media_urls."""
+def test_summarize_verosight_response_truncates_sample_and_removes_empty_media_urls(monkeypatch):
+    """Verify that summarize_verosight_response truncates sample_* to <= 5 items and strips empty media_urls when passthrough is False."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "TOOL_RESULT_PASSTHROUGH", False)
+
     raw_envelope = {
         "data": {
             "total_posts": 100,

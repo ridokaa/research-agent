@@ -5,6 +5,7 @@ import asyncio
 from contextlib import AsyncExitStack
 from typing import Any, Literal
 
+import httpx2
 import structlog
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -12,6 +13,69 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import CallToolResult, Tool
 
 logger = structlog.get_logger(__name__)
+
+
+class _SessionInitRetryTransport(httpx2.AsyncBaseTransport):
+    """Custom httpx2 transport that retries POST requests returning 404 'Session not found' during SSE session init."""
+
+    def __init__(
+        self,
+        transport: httpx2.AsyncBaseTransport,
+        max_retries: int = 5,
+        backoff_s: float = 0.2,
+    ) -> None:
+        self._transport = transport
+        self.max_retries = max_retries
+        self.backoff_s = backoff_s
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        response = await self._transport.handle_async_request(request)
+
+        # Strictly retry ONLY for 404 with 'Session not found' body during init phase
+        if request.method == "POST" and response.status_code == 404:
+            body = await response.aread()
+            body_str = body.decode("utf-8", errors="ignore").lower()
+
+            if "session not found" in body_str or "not_found" in body_str:
+                logger.warning(
+                    "mcp.session_not_found_delay_detected",
+                    url=str(request.url),
+                    msg="Server session propagation pending. Retrying POST...",
+                )
+                for attempt in range(1, self.max_retries + 1):
+                    await asyncio.sleep(self.backoff_s)
+                    new_request = httpx2.Request(
+                        method=request.method,
+                        url=request.url,
+                        headers=request.headers,
+                        content=body if request.content is None else request.content,
+                        stream=request.stream,
+                    )
+                    retry_resp = await self._transport.handle_async_request(new_request)
+                    if retry_resp.status_code != 404:
+                        logger.info(
+                            "mcp.session_init_retry_success",
+                            attempt=attempt,
+                            status=retry_resp.status_code,
+                        )
+                        return retry_resp
+
+                    retry_body = await retry_resp.aread()
+                    retry_body_str = retry_body.decode("utf-8", errors="ignore").lower()
+                    if not ("session not found" in retry_body_str or "not_found" in retry_body_str):
+                        return retry_resp
+
+                error_msg = f"MCP session init timed out after {self.max_retries} retries (404 Session not found) component=mcp stage=session_init_timeout"
+                logger.error("mcp.session_init_timeout", component="mcp", stage="session_init_timeout", error=error_msg)
+                raise RuntimeError(error_msg)
+
+        return response
+
+
+def _create_mcp_retry_http_client(headers=None, auth=None, timeout=None) -> httpx2.AsyncClient:
+    transport = httpx2.AsyncHTTPTransport()
+    retry_transport = _SessionInitRetryTransport(transport)
+    return httpx2.AsyncClient(headers=headers, auth=auth, timeout=timeout, transport=retry_transport)
 
 
 class MCPClient:
@@ -61,7 +125,12 @@ class MCPClient:
                 if not self.url:
                     raise ValueError(f"SSE transport requires 'url' for server '{self.alias}'")
                 read_stream, write_stream = await self._stack.enter_async_context(
-                    sse_client(url=self.url, headers=self.headers, timeout=self.timeout_s)
+                    sse_client(
+                        url=self.url,
+                        headers=self.headers,
+                        timeout=self.timeout_s,
+                        httpx_client_factory=_create_mcp_retry_http_client,
+                    )
                 )
             elif self.transport == "stdio":
                 if not self.command:

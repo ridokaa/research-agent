@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
@@ -44,6 +45,7 @@ from tenacity import (
 
 from app.llm.schemas import (
     LLMResponse,
+    UsageInfo,
     build_chat_tool,
     build_function_tool,
     compact_input,
@@ -126,6 +128,8 @@ class LLMClient:
         tracer: Any | None = None,
         reasoning_effort: str | None = None,
         api_style: Literal["responses", "chat_completions"] = "responses",
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         if api_style == "chat_completions":
             self._endpoint = base_url.rstrip("/") + "/chat/completions"
@@ -139,6 +143,8 @@ class LLMClient:
         self._tracer = tracer
         self._reasoning_effort = reasoning_effort
         self._api_style = api_style
+        self._temperature = temperature
+        self._max_output_tokens = max_output_tokens
 
         self._http = httpx.AsyncClient(
             headers={
@@ -168,8 +174,9 @@ class LLMClient:
 
     async def respond(
         self,
-        input: str | list[dict[str, Any]],  # noqa: A002
+        input: str | list[Any] | None = None,  # noqa: A002
         *,
+        messages: str | list[Any] | None = None,
         instructions: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] = "auto",
@@ -186,6 +193,15 @@ class LLMClient:
             Wraps an :class:`~app.schemas.errors.ErrorReport` for every failure
             category (see module docstring for the stage taxonomy).
         """
+        if input is None and messages is not None:
+            input = messages
+        if input is None:
+            input = ""
+
+        if temperature is None:
+            temperature = self._temperature
+        if max_output_tokens is None:
+            max_output_tokens = self._max_output_tokens
         # ------------------------------------------------------------------
         # Guard: missing or placeholder API key — fail explicitly before HTTP
         # ------------------------------------------------------------------
@@ -381,6 +397,14 @@ class LLMClient:
                 duration_ms=duration_ms,
             )
 
+    @staticmethod
+    def _supports_temperature(model: str) -> bool:
+        """Return False for reasoning models (e.g. o1, o3, gpt-5) which do not support temperature."""
+        m = model.lower()
+        if m.startswith(("o1", "o3", "gpt-5")):
+            return False
+        return True
+
     def _build_payload(
         self,
         input: str | list[dict[str, Any]],  # noqa: A002
@@ -402,7 +426,7 @@ class LLMClient:
             if tools:
                 payload["tools"] = tools
                 payload["tool_choice"] = tool_choice
-            if temperature is not None:
+            if temperature is not None and self._supports_temperature(self._model):
                 payload["temperature"] = temperature
             if max_output_tokens is not None:
                 payload["max_tokens"] = max_output_tokens
@@ -427,7 +451,7 @@ class LLMClient:
         if previous_response_id is not None:
             payload["previous_response_id"] = previous_response_id
 
-        if temperature is not None:
+        if temperature is not None and self._supports_temperature(self._model):
             payload["temperature"] = temperature
 
         if max_output_tokens is not None:
@@ -536,3 +560,42 @@ class LLMError(Exception):
     def __init__(self, report: ErrorReport) -> None:
         self.report = report
         super().__init__(f"LLMError[{report.stage}]: {report.message}")
+
+
+# ---------------------------------------------------------------------------
+# Chat Completions response parser helper
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ParsedChatToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any] | str
+
+
+@dataclass
+class ParsedChatResponse:
+    tool_calls: list[ParsedChatToolCall]
+    content: str | None
+    usage: UsageInfo
+
+
+def parse_chat_response(raw: dict[str, Any]) -> ParsedChatResponse:
+    """Parse a raw Chat Completions response dictionary into a structured ParsedChatResponse."""
+    response = LLMResponse.from_raw(raw)
+    tool_calls: list[ParsedChatToolCall] = []
+    for fc in response.function_calls:
+        tool_calls.append(
+            ParsedChatToolCall(
+                id=fc.call_id,
+                name=fc.name,
+                arguments=fc.arguments_dict,
+            )
+        )
+    return ParsedChatResponse(
+        tool_calls=tool_calls,
+        content=response.output_text,
+        usage=response.usage,
+    )
+

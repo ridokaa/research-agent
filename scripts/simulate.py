@@ -18,6 +18,7 @@ from app.agent.loop import AgentLoop
 from app.config import get_settings
 from app.db.session import close_engine, get_session, init_engine
 from app.schemas.agent import RunOptions
+from app.tools.registry import init_registry
 from scripts.seed_scenarios import ALL_SCENARIOS, run_all_scenarios
 
 app = typer.Typer(help="Agentic Loop local simulation CLI.")
@@ -34,6 +35,14 @@ def scenarios(
     console.print("[bold blue]Executing Agentic Loop Simulation Scenarios...[/bold blue]\n")
 
     async def _runner():
+        init_registry()
+        settings = get_settings()
+        if settings.VEROSIGHT_ENABLED and settings.VEROSIGHT_MODE in ("mcp", "both"):
+            try:
+                from app.mcp.manager import get_mcp_manager
+                await get_mcp_manager().connect_all()
+            except Exception as exc:
+                console.print(f"[bold yellow]MCP Connection warning:[/bold yellow] {exc}")
         results = await run_all_scenarios()
 
         if as_json:
@@ -92,6 +101,14 @@ def ask(
     console.print(Panel(f"[bold yellow]User Query:[/bold yellow] {query}", title="Agentic Loop Simulation"))
 
     async def _run_query():
+        init_registry()
+        settings = get_settings()
+        if settings.VEROSIGHT_ENABLED and settings.VEROSIGHT_MODE in ("mcp", "both"):
+            try:
+                from app.mcp.manager import get_mcp_manager
+                await get_mcp_manager().connect_all()
+            except Exception as exc:
+                console.print(f"[bold yellow]MCP Connection warning:[/bold yellow] {exc}")
         loop = AgentLoop()
         opts = RunOptions(max_iterations=max_iter, credits_budget=credits_budget)
         res = await loop.run(query, options=opts)

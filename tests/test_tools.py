@@ -270,7 +270,10 @@ async def test_empty_result_normalization():
 
 
 @pytest.mark.asyncio
-async def test_result_truncation_for_large_outputs():
+async def test_result_truncation_for_large_outputs(monkeypatch):
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "TOOL_RESULT_PASSTHROUGH", False)
+
     registry = ToolRegistry()
 
     @register_tool(name="large_data_tool", registry=registry)

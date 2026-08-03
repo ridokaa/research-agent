@@ -10,7 +10,7 @@ from app.schemas.errors import ErrorReport
 from app.tools.base import ToolResult
 from app.tools.registry import register_tool
 from app.tools.verosight.client import VerosightClient
-from app.tools.verosight.helpers import summarize_verosight_response
+from app.tools.verosight.helpers import summarize_search_posts_response, summarize_verosight_response
 
 
 class VerosightSearchPostsInput(BaseModel):
@@ -75,7 +75,7 @@ async def verosight_search_posts(**kwargs: Any) -> ToolResult:
             duration_ms=elapsed,
         )
 
-    summarized = summarize_verosight_response(res.data)
+    summarized = summarize_search_posts_response(res.data, query=validated.query, max_posts=5)
     credits_used = res.credits_used if res.credits_used > 0 else 5
     return ToolResult(
         tool_name="verosight_search_posts",

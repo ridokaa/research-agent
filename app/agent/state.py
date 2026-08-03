@@ -315,6 +315,23 @@ class ConversationHistory:
         await self.session.flush()
 
 
+def _to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, BaseModel):
+        return _to_jsonable(obj.model_dump(mode="json"))
+    if hasattr(obj, "model_dump"):
+        try:
+            return _to_jsonable(obj.model_dump(mode="json"))
+        except Exception:
+            pass
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(x) for x in obj]
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    return str(obj)
+
+
 async def persist_execution_memory_snapshot(
     session: AsyncSession,
     run_id: UUID,
@@ -324,7 +341,8 @@ async def persist_execution_memory_snapshot(
     """Write snapshot lines to execution_memory table for given iteration."""
     for item in execution_memory.items:
         if item.iteration == iteration:
-            val = item.value if isinstance(item.value, dict) else {"value": item.value}
+            jsonable_val = _to_jsonable(item.value)
+            val = jsonable_val if isinstance(jsonable_val, dict) else {"value": jsonable_val}
             mem_orm = ExecutionMemoryORM(
                 id=uuid.uuid4(),
                 run_id=run_id,

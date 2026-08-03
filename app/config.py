@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     AGENT_RUN_TIMEOUT_S: float = Field(default=180.0, gt=0)
     AGENT_CREDITS_BUDGET: int = Field(default=100, ge=0)
     AGENT_PARALLEL_TOOLS: bool = True
+    TOOL_RESULT_PASSTHROUGH: bool = True
     TOOLS_DISABLED: list[str] = Field(default_factory=list)
 
     @field_validator("TOOLS_DISABLED", mode="before")

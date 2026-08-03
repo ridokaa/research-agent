@@ -108,6 +108,10 @@ class ToolExecutor:
         self._registry = registry if registry is not None else get_registry()
         self._db_session = db_session
 
+    @property
+    def registry(self) -> ToolRegistry:
+        return self._registry
+
     async def execute(
         self,
         name: str,
@@ -222,6 +226,29 @@ class ToolExecutor:
                     duration_ms=elapsed,
                 )
                 break
+            except asyncio.CancelledError:
+                # anyio-based clients (e.g. the MCP SDK) can surface a wait_for
+                # timeout as CancelledError across the anyio<->asyncio boundary
+                # instead of TimeoutError. CancelledError is a BaseException, so it
+                # is NOT caught by the handlers below and would otherwise escape the
+                # executor, the agent loop, and crash the request with a raw 500.
+                # If THIS task is being cancelled by an outer scope (server shutdown
+                # or client disconnect), re-raise so cancellation still works.
+                # Otherwise treat it as a per-tool timeout, exactly like TimeoutError.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling() > 0:
+                    raise
+                elapsed = int((time.perf_counter() - start_time) * 1000)
+                tool_result_obj = ToolResult(
+                    tool_name=name,
+                    status="timeout",
+                    error=(
+                        f"Tool '{name}' timed out after {tool.spec.timeout_s}s "
+                        "(call cancelled at the MCP/anyio boundary)."
+                    ),
+                    duration_ms=elapsed,
+                )
+                break
             except _TRANSIENT_EXCEPTIONS as exc:
                 if attempt >= max_attempts:
                     elapsed = int((time.perf_counter() - start_time) * 1000)
@@ -270,8 +297,10 @@ class ToolExecutor:
         except Exception:
             pass
 
-        # Truncate large payloads before LLM context entry
-        res = _truncate_result(res)
+        # Truncate large payloads before LLM context entry unless passthrough is enabled
+        settings = get_settings()
+        if not settings.TOOL_RESULT_PASSTHROUGH:
+            res = _truncate_result(res)
 
         # Log & record invocation
         await self._record_execution(
@@ -296,7 +325,7 @@ class ToolExecutor:
     ) -> list[ToolResult]:
         """Execute multiple tool calls sequentially or in parallel."""
         settings = get_settings()
-        if settings.AGENT_PARALLEL_TOOLS:
+        if settings.AGENT_PARALLEL_TOOLS and len(calls) > 1:
             tasks = [
                 self.execute(
                     name=name,
@@ -304,11 +333,30 @@ class ToolExecutor:
                     tracer=tracer,
                     run_id=run_id,
                     step_seq=step_seq,
-                    db_session=db_session,
+                    db_session=None,
                 )
                 for name, args in calls
             ]
-            return list(await asyncio.gather(*tasks))
+            results = list(await asyncio.gather(*tasks))
+            if db_session is not None:
+                for (name, args), res in zip(calls, results):
+                    args_dict = (
+                        args
+                        if isinstance(args, dict)
+                        else (json.loads(args) if isinstance(args, str) and args.strip().startswith("{") else {})
+                    )
+                    tool = self._registry.get(name)
+                    source = tool.spec.source if tool else "local"
+                    await self._record_execution(
+                        res=res,
+                        arguments=args_dict,
+                        tracer=None,
+                        run_id=run_id,
+                        step_seq=step_seq,
+                        session=db_session,
+                        source=source,
+                    )
+            return results
 
         results: list[ToolResult] = []
         for name, args in calls:
@@ -352,16 +400,20 @@ class ToolExecutor:
         effective_run_id = run_id or (tracer.run_id if tracer is not None else None)
         if session is not None and effective_run_id is not None:
             try:
+                from app.agent.state import _to_jsonable
+
                 repo = ToolInvocationRepo(session)
+                raw = res.raw_data if res.raw_data is not None else res.model_dump()
+                result_json = _to_jsonable(raw)
                 result_payload = (
-                    res.raw_data if res.raw_data is not None else res.model_dump()
+                    result_json if isinstance(result_json, dict) else {"result": result_json}
                 )
                 await repo.record_invocation(
                     run_id=effective_run_id,
                     tool_name=res.tool_name,
                     source=source,
                     step_seq=step_seq,
-                    arguments=arguments,
+                    arguments=_to_jsonable(arguments),
                     result=result_payload,
                     status=res.status,
                     error=res.error,

@@ -9,6 +9,7 @@ from app.tools.executor import ToolExecutor
 from app.tools.registry import (
     ToolRegistry,
     get_registry,
+    init_registry,
     register_tool,
     reset_registry,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "ToolExecutor",
     "build_schema_from_pydantic",
     "get_registry",
+    "init_registry",
     "register_tool",
     "reset_registry",
 ]

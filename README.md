@@ -195,3 +195,16 @@ Keputusan arsitektur mendasar dicatat dalam direktori `docs/adr/`:
 - [`0001-only-final-answer-in-query-response.md`](docs/adr/0001-only-final-answer-in-query-response.md): Alasan pengembalian jawaban bersih tanpa proses berpikir pada endpoint `/v1/agent/query`.
 - [`0002-tool-call-deduplication.md`](docs/adr/0002-tool-call-deduplication.md): Strategi deduplikasi & caching hasil tool untuk mencegah loop tak berujung.
 - [`0003-mcp-and-rest-separation.md`](docs/adr/0003-mcp-and-rest-separation.md): Pemisahan integrasi dinamis MCP dan wrapper REST lokal.
+
+---
+
+## 7. Postman Collection & Environment
+
+Postman Collection (v2.1) dan Environment telah disediakan di direktori [`docs/postman/`](docs/postman/):
+
+1. **Import File ke Postman:**
+   - [Postman Collection](docs/postman/Agentic_Loop_API.postman_collection.json) (`Agentic_Loop_API.postman_collection.json`)
+   - [Postman Environment](docs/postman/Agentic_Loop_Local.postman_environment.json) (`Agentic_Loop_Local.postman_environment.json`)
+2. **Pilih Environment:** Aktifkan environment **`Agentic Loop — Local`** (`baseUrl: http://localhost:8000`).
+3. **Fitur Otomatisasi:** Request `POST /v1/agent/query` secara otomatis mengekstrak `run_id` dan `conversation_id` dari response JSON dan menyimpannya ke Environment untuk digunakan di endpoint `Runs` dan `Conversations`.
+

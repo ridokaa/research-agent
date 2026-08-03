@@ -11,6 +11,21 @@ from app.mcp.client import MCPClient
 from app.tools.base import BaseTool, ToolResult, ToolSpec
 
 
+def _normalize_responses_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Non-destructively normalize inputSchema for OpenAI Responses API compatibility."""
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+
+    res_schema = dict(schema)
+    if "type" not in res_schema:
+        res_schema["type"] = "object"
+
+    if res_schema.get("type") == "object" and "properties" not in res_schema:
+        res_schema["properties"] = {}
+
+    return res_schema
+
+
 def mcp_tool_to_spec(tool: Tool, server_alias: str, available: bool = True) -> ToolSpec:
     """Convert an MCP Tool schema to internal ToolSpec with prefix '{server_alias}__{tool_name}'."""
     tool_name = f"{server_alias}__{tool.name}"
@@ -29,8 +44,7 @@ def mcp_tool_to_spec(tool: Tool, server_alias: str, available: bool = True) -> T
         elif hasattr(tool.inputSchema, "model_dump"):
             parameters = tool.inputSchema.model_dump()
 
-    if not parameters:
-        parameters = {"type": "object", "properties": {}}
+    parameters = _normalize_responses_schema(parameters)
 
     return ToolSpec(
         name=tool_name,

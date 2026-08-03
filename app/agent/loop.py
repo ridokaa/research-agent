@@ -32,7 +32,7 @@ from app.logging.tracer import RunTracer
 from app.schemas.agent import RunOptions, RunResult
 from app.schemas.errors import ErrorReport
 from app.tools.executor import ToolExecutor
-from app.tools.registry import ToolRegistry, get_registry
+from app.tools.registry import ToolRegistry, get_registry, init_registry
 
 log = structlog.get_logger(__name__)
 
@@ -82,7 +82,7 @@ class AgentLoop:
         run_id = uuid.uuid4()
         conv_id = conversation_id or uuid.uuid4()
 
-        registry = self.registry if self.registry is not None else get_registry()
+        registry = self.registry if self.registry is not None else init_registry()
         executor = (
             self.executor
             if self.executor is not None
@@ -139,6 +139,8 @@ class AgentLoop:
                 tracer=tracer,
                 reasoning_effort=settings.LLM_REASONING_EFFORT,
                 api_style=settings.LLM_API_STYLE,
+                temperature=settings.LLM_TEMPERATURE,
+                max_output_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
             )
 
         state = AgentState(
@@ -205,11 +207,11 @@ class AgentLoop:
                 # --- 2. LLM respond ---
                 try:
                     api_style = getattr(llm, "_api_style", settings.LLM_API_STYLE)
-                    tools_def = registry.to_tools(api_style=api_style)
-                    if opts.tools_allow is not None:
-                        tools_def = [t for t in tools_def if t.get("name") in opts.tools_allow]
-                    if opts.tools_deny is not None:
-                        tools_def = [t for t in tools_def if t.get("name") not in opts.tools_deny]
+                    tools_def = registry.to_tools(
+                        api_style=api_style,
+                        tools_allow=opts.tools_allow,
+                        tools_deny=opts.tools_deny,
+                    )
                     response = await llm.respond(
                         input=llm_input,
                         instructions=instructions,
@@ -453,6 +455,13 @@ class AgentLoop:
                     payload={"answer": final_answer, "status": state.status},
                 )
 
+        except Exception as exc:
+            state.status = "failed"
+            log.exception("agent_loop.unhandled_error", error=str(exc))
+            rep = ErrorReport(component="api", stage="execution", message=str(exc))
+            tracer.event("error", f"Uncaught run error: {exc}", payload=rep.model_dump())
+            final_answer = f"Run failed due to internal error: {exc}"
+
         finally:
             if self.llm_client is None:
                 await llm.aclose()
@@ -477,21 +486,27 @@ class AgentLoop:
         )
 
         if self.session is not None and run_repo is not None:
-            await run_repo.update_status(
-                run_id,
-                status=state.status,
-                final_answer=final_answer or "",
-                iterations=state.iteration,
-                credits_used=state.credits_used,
-                latency_ms=latency_ms,
-                last_response_id=state.last_response_id,
-            )
-            if conv_history is not None:
-                await conv_history.persist_iteration(
-                    state.messages, run_id=run_id, last_response_id=state.last_response_id
+            try:
+                await run_repo.update_status(
+                    run_id,
+                    status=state.status,
+                    final_answer=final_answer or "",
+                    iterations=state.iteration,
+                    credits_used=state.credits_used,
+                    latency_ms=latency_ms,
+                    last_response_id=state.last_response_id,
                 )
+                if conv_history is not None:
+                    await conv_history.persist_iteration(
+                        state.messages, run_id=run_id, last_response_id=state.last_response_id
+                    )
+            except Exception as db_exc:
+                log.warning("agent_loop.db_persistence_failed", error=str(db_exc))
 
-        await tracer.flush()
+        try:
+            await tracer.flush()
+        except Exception as tracer_exc:
+            log.warning("agent_loop.tracer_flush_failed", error=str(tracer_exc))
 
         self.last_state = state
         self.last_tracer = tracer

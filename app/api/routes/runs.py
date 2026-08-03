@@ -27,7 +27,7 @@ class ToolInvocationResponse(BaseModel):
     tool_name: str
     source: str
     arguments: dict[str, Any] | None = None
-    result: dict[str, Any] | None = None
+    result: Any | None = None
     status: str
     error: str | None = None
     duration_ms: int | None = None

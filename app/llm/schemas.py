@@ -74,7 +74,7 @@ def to_chat_tool_output(call_id: str, result_text: str) -> dict[str, Any]:
 
 
 def to_chat_messages(
-    input_data: str | list[dict[str, Any]],
+    input_data: str | list[Any],
     instructions: str | None = None,
 ) -> list[dict[str, Any]]:
     """Convert neutral input / instructions into OpenAI Chat Completions messages list format."""
@@ -87,6 +87,17 @@ def to_chat_messages(
         if input_data.strip():
             messages.append({"role": "user", "content": input_data})
         return messages
+
+    if isinstance(input_data, list):
+        converted: list[dict[str, Any]] = []
+        for item in input_data:
+            if hasattr(item, "model_dump"):
+                converted.append(item.model_dump(exclude_none=True))
+            elif isinstance(item, dict):
+                converted.append(item)
+            elif hasattr(item, "__dict__"):
+                converted.append(dict(item.__dict__))
+        input_data = converted
 
     for item in input_data:
         if not isinstance(item, dict):
@@ -113,8 +124,23 @@ def to_chat_messages(
             else:
                 msg_dict["content"] = None
 
-            if "tool_calls" in item:
-                msg_dict["tool_calls"] = item["tool_calls"]
+            raw_tc = item.get("tool_calls")
+            if raw_tc:
+                tool_calls = []
+                for tc in raw_tc:
+                    if isinstance(tc, dict):
+                        tool_calls.append(tc)
+                    elif hasattr(tc, "id") or hasattr(tc, "call_id"):
+                        tc_id = getattr(tc, "id", getattr(tc, "call_id", ""))
+                        tc_name = getattr(tc, "name", "")
+                        tc_args = getattr(tc, "arguments", getattr(tc, "arguments_dict", {}))
+                        args_str = json.dumps(tc_args) if isinstance(tc_args, dict) else str(tc_args)
+                        tool_calls.append({
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {"name": tc_name, "arguments": args_str},
+                        })
+                msg_dict["tool_calls"] = tool_calls
             elif "function_calls" in item and item["function_calls"]:
                 tool_calls = []
                 for fc in item["function_calls"]:
@@ -218,6 +244,14 @@ class FunctionCall:
         """Convenience wrapper: produce the function_call_output input item."""
         return to_function_call_output(self.call_id, result_text)
 
+    @property
+    def id(self) -> str:
+        return self.call_id
+
+    @property
+    def arguments(self) -> dict[str, Any]:
+        return self.arguments_dict
+
 
 @dataclass
 class LLMResponse:
@@ -230,6 +264,14 @@ class LLMResponse:
     incomplete_reason: str | None
     usage: UsageInfo
     raw: dict[str, Any]
+
+    @property
+    def tool_calls(self) -> list[FunctionCall]:
+        return self.function_calls
+
+    @property
+    def content(self) -> str | None:
+        return self.output_text
 
     # ------------------------------------------------------------------
     # Factories

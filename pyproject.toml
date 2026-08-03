@@ -56,7 +56,7 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
-    "live: marks tests that make real network calls (deselect with '-m not live')",
+    "live: butuh layanan eksternal asli (LLM/gateway); skip bila key tak ada",
 ]
 
 [tool.hatch.build.targets.wheel]
