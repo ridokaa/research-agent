@@ -1129,12 +1129,25 @@ tier rendah. Detail: `docs/Plan-perubahan-model.md`, `docs/plan-percobaan-model-
   **bukan** HTTP 500 tersamar. (Akar & rencana: `docs/plan-fix-500-agent-query.md`.)
 - `app/api/exceptions.py`: pada `APP_ENV=local`, pesan 500 memuat tipe + detail exception
   (memudahkan debug lewat Postman).
-- `app/tools/executor.py` — **fix `CancelledError` (2026-08-03):** timeout `asyncio.wait_for`
-  di sekitar panggilan MCP bisa bocor sebagai `asyncio.CancelledError` (BaseException) dari
-  batas anyio SDK MCP, lolos semua handler `except Exception`, dan menjatuhkan request jadi
-  `RuntimeError: No response returned` → 500. Sekarang ditangkap dan dikonversi menjadi
-  `ToolResult(status="timeout")` (dengan guard: tetap `raise` bila task dibatalkan dari luar
-  seperti shutdown/disconnect). Terverifikasi: unit test deterministik + end-to-end server 200.
+- `app/tools/executor.py` + `app/mcp/client.py` — **fix `CancelledError`/`No response returned`
+  (2026-08-03):** `asyncio.wait_for` di sekitar panggilan MCP tidak menyatu dengan cancel-scope
+  anyio SDK MCP → `CancelledError` (BaseException) bocor lolos semua `except Exception` → request
+  jatuh jadi `RuntimeError: No response returned` → 500 intermiten. Perbaikan final: (a) ganti
+  `wait_for` dengan `asyncio.wait({task}, timeout=...)` + pembatalan eksplisit (tidak membatalkan
+  task pemanggil); (b) handler `except CancelledError` memanggil `current.uncancel()` lalu
+  mengubah jadi `ToolResult(status="timeout")`; (c) `asyncio.Lock` per `MCPClient` menyerialisasi
+  panggilan pada satu sesi MCP (menghindari tabrakan konkuren saat `parallel_tools=true`).
+  Rencana: `docs/plan-fix-cancellederror-mcp-waitfor.md`. Terverifikasi: `tests/test_mcp_waitfor_fix.py`.
+- `app/agent/loop.py` — **fix `RunResult.status='running'` → 500 (2026-08-03):** jalur "respons
+  LLM kosong → break to finalizer" dulu meninggalkan `state.status="running"`, lalu
+  `RunResult(status="running")` gagal validasi (di luar `try/except`) → 500. Sekarang status
+  dipaksa terminal (`success`/`exhausted`) di finalizer + guard `safe_status` sebelum `RunResult`.
+  Rencana: `docs/plan-fix-runresult-status-500.md`.
+- `app/agent/loop.py` — **fix respons kosong saat sintesis (chat mode) (2026-08-03):** riwayat
+  chat yang dikirim ulang dulu memuat pesan `tool` tanpa `assistant` ber-`tool_calls` pendahulu
+  (urutan tidak valid) → deepseek balas kosong → fallback membuang data. Sekarang loop menyimpan
+  item `type="function_call"` (assistant request) di `pending_inputs` agar serialisasi chat valid.
+  Rencana: `docs/plan-fix-empty-synthesis-and-fallback.md`.
 
 ### 6.6 Penyaringan per-lokasi (system prompt) — TERIMPLEMENTASI
 
@@ -1161,6 +1174,12 @@ tier rendah. Detail: `docs/Plan-perubahan-model.md`, `docs/plan-percobaan-model-
 - `plan-fix-500-agent-query.md` — akar & perbaikan 500 (loop tanpa `except`).
 - `plan-percobaan-model-berbeda.md` — uji model & penyaringan lokasi.
 - `plan-switch-deepseek-9router.md` — peralihan ke deepseek-v4-pro via 9Router.
+- `plan-fix-runresult-status-500.md` — fix status `running` bocor ke `RunResult`.
+- `plan-fix-empty-synthesis-and-fallback.md` — fix respons kosong (format pesan chat) & finalizer setia data.
+- `plan-fix-cancellederror-mcp-waitfor.md` — fix `CancelledError` MCP/`wait_for` → 500.
+- `catatan/store-true-false.md` — catatan perilaku `store` di gaya chat.
 
-> Catatan: perubahan kode di atas **belum di-commit** (branch `retrofit/chat-completions-adapter`).
-> `.env` berisi kredensial nyata dan **tidak** di-track git.
+> Catatan: perubahan kode di atas berada di branch `retrofit/chat-completions-adapter` dan
+> di-commit/di-push bertahap. `.env` berisi kredensial nyata dan **tidak** di-track git
+> (dikecualikan dari commit). Direktori `AgenticTools/` adalah repo git terpisah dan juga
+> dikecualikan.

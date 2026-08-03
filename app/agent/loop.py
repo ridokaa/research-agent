@@ -79,6 +79,10 @@ class AgentLoop:
             store=settings.LLM_STORE,
         )
 
+        effective_api_style = getattr(self.llm_client, "_api_style", settings.LLM_API_STYLE)
+        if effective_api_style == "chat_completions" and opts.store:
+            opts = opts.model_copy(update={"store": False})
+
         run_id = uuid.uuid4()
         conv_id = conversation_id or uuid.uuid4()
 
@@ -282,6 +286,15 @@ class AgentLoop:
                         payload={"tools": tool_calls_payload},
                     )
 
+                    # Store assistant tool call requests in pending_inputs to preserve chat sequence
+                    for fc in response.function_calls:
+                        pending_inputs.append({
+                            "type": "function_call",
+                            "call_id": fc.call_id,
+                            "name": fc.name,
+                            "arguments": fc.arguments_dict,
+                        })
+
                     new_info_obtained = False
                     uncached_calls: list[tuple[Any, tuple[str, dict[str, Any]]]] = []
 
@@ -426,6 +439,10 @@ class AgentLoop:
                     continue
 
                 # If model returned neither function calls nor output text, break to finalizer
+                tracer.event(
+                    "thinking",
+                    "LLM returned empty response (no tool calls, no output text); breaking to finalizer",
+                )
                 break
 
             # --- Exhausted / Timeout / Fallback Finalization ---
@@ -449,6 +466,9 @@ class AgentLoop:
                     else:
                         final_answer = f"Informasi tidak cukup untuk menjawab secara lengkap ({exc})."
 
+                if state.status == "running":
+                    state.status = "success" if final_answer else "exhausted"
+
                 tracer.event(
                     "final_answer",
                     f"Fallback answer generated (status={state.status})",
@@ -465,6 +485,10 @@ class AgentLoop:
         finally:
             if self.llm_client is None:
                 await llm.aclose()
+
+        # Ensure state.status is never 'running'
+        if state.status not in ("success", "failed", "exhausted", "timeout"):
+            state.status = "exhausted" if final_answer else "failed"
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -520,14 +544,26 @@ class AgentLoop:
         except Exception:
             pass
 
-        return RunResult(
-            run_id=run_id,
-            conversation_id=conv_id,
-            answer=final_answer or "",
-            status=state.status,  # type: ignore[arg-type]
-            iterations=state.iteration,
-            latency_ms=latency_ms,
-        )
+        try:
+            return RunResult(
+                run_id=run_id,
+                conversation_id=conv_id,
+                answer=final_answer or "",
+                status=state.status,  # type: ignore[arg-type]
+                iterations=state.iteration,
+                latency_ms=latency_ms,
+            )
+        except Exception as exc:
+            log.exception("agent_loop.run_result_construction_failed", error=str(exc))
+            safe_status = state.status if state.status in ("success", "failed", "exhausted", "timeout") else "failed"
+            return RunResult(
+                run_id=run_id,
+                conversation_id=conv_id,
+                answer=final_answer or f"Run completed with status error: {exc}",
+                status=safe_status,
+                iterations=state.iteration,
+                latency_ms=latency_ms,
+            )
 
 
 async def run_agent(

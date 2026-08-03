@@ -111,8 +111,11 @@ class Planner:
         """Build prompt for forced finalization on exhausted/timeout status."""
         return (
             f"Pertanyaan pengguna: {user_query}\n\n"
-            f"Data yang sudah diperoleh dari tool sejauh ini:\n"
+            f"Berikut data tool yang SUDAH TERKUMPUL di memori eksekusi:\n"
             f"{execution_memory_text or '(Belum ada data tool yang berhasil diperoleh)'}\n\n"
-            f"Instruksi: Jawab sejujurnya dengan data yang ada, sebutkan keterbatasannya. "
-            f"JANGAN mengarang data baru."
+            f"Instruksi WAJIB:\n"
+            f"1. Rangkum dan sajikan SELURUH data nyata yang ada di atas untuk menjawab pertanyaan pengguna.\n"
+            f"2. Sebutkan angka, statistik, dan fakta spesifik yang ada di memori.\n"
+            f"3. DILARANG MENYATAKAN bahwa 'tidak ada data' atau 'belum ada data' bila memori di atas memuat data!\n"
+            f"4. Sebutkan keterbatasan bila ada aspek yang belum terjawab, namun JANGAN MENGABAIKAN data yang sudah berhasil terkumpul."
         )

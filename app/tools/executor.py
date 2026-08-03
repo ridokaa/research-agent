@@ -212,11 +212,25 @@ class ToolExecutor:
         while attempt < max_attempts:
             attempt += 1
             try:
-                raw_output = await asyncio.wait_for(
-                    tool.run(**args_dict),
-                    timeout=tool.spec.timeout_s,
-                )
-                break
+                task = asyncio.ensure_future(tool.run(**args_dict))
+                done, _pending = await asyncio.wait({task}, timeout=tool.spec.timeout_s)
+                if task in done:
+                    raw_output = task.result()
+                    break
+                else:
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                    elapsed = int((time.perf_counter() - start_time) * 1000)
+                    tool_result_obj = ToolResult(
+                        tool_name=name,
+                        status="timeout",
+                        error=f"Tool '{name}' timed out after {tool.spec.timeout_s}s",
+                        duration_ms=elapsed,
+                    )
+                    break
             except TimeoutError:
                 elapsed = int((time.perf_counter() - start_time) * 1000)
                 tool_result_obj = ToolResult(
@@ -227,17 +241,12 @@ class ToolExecutor:
                 )
                 break
             except asyncio.CancelledError:
-                # anyio-based clients (e.g. the MCP SDK) can surface a wait_for
-                # timeout as CancelledError across the anyio<->asyncio boundary
-                # instead of TimeoutError. CancelledError is a BaseException, so it
-                # is NOT caught by the handlers below and would otherwise escape the
-                # executor, the agent loop, and crash the request with a raw 500.
-                # If THIS task is being cancelled by an outer scope (server shutdown
-                # or client disconnect), re-raise so cancellation still works.
-                # Otherwise treat it as a per-tool timeout, exactly like TimeoutError.
                 current = asyncio.current_task()
-                if current is not None and current.cancelling() > 0:
-                    raise
+                if current is not None and hasattr(current, "uncancel"):
+                    try:
+                        current.uncancel()
+                    except Exception:
+                        pass
                 elapsed = int((time.perf_counter() - start_time) * 1000)
                 tool_result_obj = ToolResult(
                     tool_name=name,
@@ -337,7 +346,21 @@ class ToolExecutor:
                 )
                 for name, args in calls
             ]
-            results = list(await asyncio.gather(*tasks))
+            raw_results = list(await asyncio.gather(*tasks, return_exceptions=True))
+            results: list[ToolResult] = []
+            for (name, _), res in zip(calls, raw_results):
+                if isinstance(res, ToolResult):
+                    results.append(res)
+                else:
+                    err_msg = str(res) if res is not None else "Unknown error in parallel tool execution"
+                    results.append(
+                        ToolResult(
+                            tool_name=name,
+                            status="error",
+                            error=f"Tool '{name}' execution failed: {err_msg}",
+                            duration_ms=0,
+                        )
+                    )
             if db_session is not None:
                 for (name, args), res in zip(calls, results):
                     args_dict = (

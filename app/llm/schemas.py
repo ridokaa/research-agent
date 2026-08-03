@@ -162,15 +162,24 @@ def to_chat_messages(
             name = item.get("name", "")
             raw_args = item.get("arguments", "{}")
             args_str = json.dumps(raw_args) if isinstance(raw_args, dict) else str(raw_args)
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": args_str},
-                }],
-            })
+            tc_dict = {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": args_str},
+            }
+            if (
+                messages
+                and messages[-1].get("role") == "assistant"
+                and "tool_calls" in messages[-1]
+                and isinstance(messages[-1]["tool_calls"], list)
+            ):
+                messages[-1]["tool_calls"].append(tc_dict)
+            else:
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [tc_dict],
+                })
         elif "content" in item and "role" in item:
             messages.append({
                 "role": item["role"],
@@ -391,7 +400,25 @@ def compact_input(
     if len(items) <= keep_last_n:
         return list(items)
 
-    trimmed = list(items[-keep_last_n:])
+    start_idx = len(items) - keep_last_n
+    call_ids_in_trimmed = {
+        it.get("call_id") for it in items[start_idx:] if isinstance(it, dict) and it.get("type") == "function_call"
+    }
+    while start_idx > 0:
+        first_item = items[start_idx]
+        if isinstance(first_item, dict):
+            is_output = first_item.get("type") == "function_call_output" or first_item.get("role") == "tool"
+            if is_output:
+                output_call_id = first_item.get("call_id") or first_item.get("tool_call_id")
+                if output_call_id and output_call_id not in call_ids_in_trimmed:
+                    start_idx -= 1
+                    prev_item = items[start_idx]
+                    if isinstance(prev_item, dict) and prev_item.get("type") == "function_call":
+                        call_ids_in_trimmed.add(prev_item.get("call_id"))
+                    continue
+        break
+
+    trimmed = list(items[start_idx:])
 
     if summary:
         summary_item: dict[str, Any] = {

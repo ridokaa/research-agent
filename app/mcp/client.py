@@ -108,6 +108,13 @@ class MCPClient:
         self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
         self._is_connected = False
+        self._lock: asyncio.Lock | None = None
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     @property
     def is_connected(self) -> bool:
@@ -160,58 +167,60 @@ class MCPClient:
 
     async def list_tools(self) -> list[Tool]:
         """List available tools from the MCP server with auto-reconnect."""
-        last_exc: BaseException | None = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                if not self.is_connected:
-                    await self.connect()
-                assert self._session is not None
-                res = await self._session.list_tools()
-                return res.tools
-            except BaseException as exc:
-                last_exc = exc
-                logger.warning(
-                    "mcp.list_tools_error",
-                    alias=self.alias,
-                    attempt=attempt,
-                    max_retries=self.max_retries,
-                    error=str(exc),
-                )
-                await self.close()
-                if attempt < self.max_retries:
-                    await asyncio.sleep(self.backoff_s * (2 ** (attempt - 1)))
+        async with self.lock:
+            last_exc: BaseException | None = None
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    if not self.is_connected:
+                        await self.connect()
+                    assert self._session is not None
+                    res = await self._session.list_tools()
+                    return res.tools
+                except BaseException as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "mcp.list_tools_error",
+                        alias=self.alias,
+                        attempt=attempt,
+                        max_retries=self.max_retries,
+                        error=str(exc),
+                    )
+                    await self.close()
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(self.backoff_s * (2 ** (attempt - 1)))
 
-        if last_exc:
-            raise last_exc
-        return []
+            if last_exc:
+                raise last_exc
+            return []
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> CallToolResult:
         """Execute a tool call on the MCP server with auto-reconnect."""
-        last_exc: BaseException | None = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                if not self.is_connected:
-                    await self.connect()
-                assert self._session is not None
-                res = await self._session.call_tool(name=name, arguments=arguments or {})
-                return res
-            except BaseException as exc:
-                last_exc = exc
-                logger.warning(
-                    "mcp.call_tool_error",
-                    alias=self.alias,
-                    tool_name=name,
-                    attempt=attempt,
-                    max_retries=self.max_retries,
-                    error=str(exc),
-                )
-                await self.close()
-                if attempt < self.max_retries:
-                    await asyncio.sleep(self.backoff_s * (2 ** (attempt - 1)))
+        async with self.lock:
+            last_exc: BaseException | None = None
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    if not self.is_connected:
+                        await self.connect()
+                    assert self._session is not None
+                    res = await self._session.call_tool(name=name, arguments=arguments or {})
+                    return res
+                except BaseException as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "mcp.call_tool_error",
+                        alias=self.alias,
+                        tool_name=name,
+                        attempt=attempt,
+                        max_retries=self.max_retries,
+                        error=str(exc),
+                    )
+                    await self.close()
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(self.backoff_s * (2 ** (attempt - 1)))
 
-        if last_exc:
-            raise last_exc
-        raise RuntimeError(f"Failed to call tool '{name}' on MCP server '{self.alias}'")
+            if last_exc:
+                raise last_exc
+            raise RuntimeError(f"Failed to call tool '{name}' on MCP server '{self.alias}'")
 
     async def close(self) -> None:
         """Close connection and clean up resources."""

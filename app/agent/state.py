@@ -192,8 +192,18 @@ class ExecutionMemory(BaseModel):
 
         lines = [header]
         for item in selected:
+            val_detail = ""
+            if item.value is not None and item.status == "success":
+                val_str = (
+                    json.dumps(item.value, ensure_ascii=False)
+                    if isinstance(item.value, (dict, list))
+                    else str(item.value)
+                )
+                if len(val_str) > 500:
+                    val_str = val_str[:500] + "..."
+                val_detail = f" | Data: {val_str}"
             lines.append(
-                f"- [Iter {item.iteration} | {item.origin_tool}] {item.key}: {item.summary}"
+                f"- [Iter {item.iteration} | {item.origin_tool}] {item.key}: {item.summary}{val_detail}"
             )
 
         return "\n".join(lines)
