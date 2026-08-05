@@ -92,9 +92,11 @@ class Settings(BaseSettings):
     VEROSIGHT_API_BASE: str = "https://api.verosight.com"
     VEROSIGHT_API_KEY: str = "vlt_live_xxx"
     VEROSIGHT_MCP_SSE_URL: str = "https://api.verosight.com/v1/mcp/sse"
+    VEROSIGHT_MCP_TRANSPORT: Literal["sse", "streamable_http", "stdio"] = "sse"
     VEROSIGHT_ENABLED: bool = True
     VEROSIGHT_MODE: Literal["rest", "mcp", "both"] = "mcp"
     MCP_SERVERS_JSON: str = ""
+    MCP_TIMEOUT_S: float = Field(default=60.0, gt=0)
 
     @model_validator(mode="after")
     def validate_no_placeholder_secrets(self) -> Settings:

@@ -26,6 +26,9 @@ def _normalize_responses_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return res_schema
 
 
+SLOW_MCP_TOOLS = {"get_topics", "get_topic_sentiment", "get_sentiment_trend", "get_trending"}
+
+
 def mcp_tool_to_spec(tool: Tool, server_alias: str, available: bool = True) -> ToolSpec:
     """Convert an MCP Tool schema to internal ToolSpec with prefix '{server_alias}__{tool_name}'."""
     tool_name = f"{server_alias}__{tool.name}"
@@ -45,6 +48,7 @@ def mcp_tool_to_spec(tool: Tool, server_alias: str, available: bool = True) -> T
             parameters = tool.inputSchema.model_dump()
 
     parameters = _normalize_responses_schema(parameters)
+    timeout_s = 90.0 if tool.name in SLOW_MCP_TOOLS else 60.0
 
     return ToolSpec(
         name=tool_name,
@@ -52,7 +56,7 @@ def mcp_tool_to_spec(tool: Tool, server_alias: str, available: bool = True) -> T
         parameters=parameters,
         source="mcp",
         cost_credits=0,
-        timeout_s=30.0,
+        timeout_s=timeout_s,
         tags=["mcp", server_alias],
         available=available,
     )
@@ -66,8 +70,11 @@ def mcp_result_to_tool_result(
     """Convert MCP CallToolResult content blocks into internal ToolResult."""
     text_blocks: list[str] = []
     structured: Any | None = getattr(result, "structured_content", None)
+    if structured is None:
+        structured = getattr(result, "data", None)
 
-    for block in result.content:
+    content_list = getattr(result, "content", []) or []
+    for block in content_list:
         if hasattr(block, "text") and block.text:
             text_blocks.append(block.text)
         elif hasattr(block, "value") and block.value:
@@ -85,7 +92,7 @@ def mcp_result_to_tool_result(
         except json.JSONDecodeError:
             parsed_data = combined_text
 
-    is_err = bool(result.is_error)
+    is_err = bool(getattr(result, "is_error", getattr(result, "isError", False)))
     if is_err:
         status = "error"
         error_msg = combined_text or "MCP tool call failed"
@@ -147,14 +154,16 @@ class MCPTool(BaseTool):
             mcp_result = await self._client.call_tool(
                 name=self._original_tool_name,
                 arguments=kwargs,
+                timeout_s=self._spec.timeout_s,
             )
             duration_ms = int((time.monotonic() - start_time) * 1000)
             return mcp_result_to_tool_result(mcp_result, self._spec.name, duration_ms)
         except Exception as exc:
             duration_ms = int((time.monotonic() - start_time) * 1000)
+            is_timeout = isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timed out" in str(exc).lower()
             return ToolResult(
                 tool_name=self._spec.name,
-                status="error",
+                status="timeout" if is_timeout else "error",
                 error=str(exc),
                 duration_ms=duration_ms,
             )

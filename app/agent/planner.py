@@ -99,10 +99,20 @@ class Planner:
             "content": content,
         }
 
-    def build_finalize_input(self, draft_answer: str, execution_memory_text: str = "") -> str:
+    def build_finalize_input(
+        self,
+        draft_answer: str,
+        execution_memory_text: str = "",
+        executed_tools: list[str] | None = None,
+        available_tools: list[str] | None = None,
+    ) -> str:
         """Build prompt for self-check finalization evaluation."""
+        executed_str = ", ".join(executed_tools) if executed_tools else "(Belum ada tool)"
+        available_str = ", ".join(available_tools) if available_tools else "(Semua tool)"
         return (
             f"{self._finalize_template}\n\n"
+            f"--- Tool yang SUDAH Dipanggil ---\n{executed_str}\n\n"
+            f"--- Tool TERSEDIA yang BELUM Dipanggil ---\n{available_str}\n\n"
             f"--- Draf Jawaban ---\n{draft_answer}\n\n"
             f"--- Data Tool Terkait ---\n{execution_memory_text or '(Tidak ada data tool)'}"
         )
@@ -119,3 +129,17 @@ class Planner:
             f"3. DILARANG MENYATAKAN bahwa 'tidak ada data' atau 'belum ada data' bila memori di atas memuat data!\n"
             f"4. Sebutkan keterbatasan bila ada aspek yang belum terjawab, namun JANGAN MENGABAIKAN data yang sudah berhasil terkumpul."
         )
+
+    def build_synthesis_input(self, user_query: str, execution_memory_text: str = "") -> str:
+        """Build prompt for proactive right-sized synthesis when synthesis_mode=True."""
+        return (
+            f"Pertanyaan pengguna: {user_query}\n\n"
+            f"Berikut data ringkas yang SUDAH TERKUMPUL dari tool:\n"
+            f"{execution_memory_text or '(Belum ada data tool yang diperoleh)'}\n\n"
+            f"Instruksi Sintesis:\n"
+            f"1. Analisis dan jawab pertanyaan pengguna secara komprehensif menggunakan data di atas.\n"
+            f"2. Sertakan angka, statistik, topik, dan sentimen secara akurat dari data yang tersedia.\n"
+            f"3. DILARANG MENYATAKAN bahwa 'tidak ada data' atau 'belum ada data' bila memori di atas memuat data!\n"
+            f"4. Jangan mengabaikan data yang sudah ada, dan sebutkan keterbatasan hanya jika data memang tidak mencakup aspek tersebut."
+        )
+

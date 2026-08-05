@@ -168,6 +168,105 @@ async def test_mcp_client_auto_reconnect_retry_success():
         assert mock_connect.call_count == 1
 
 
+@pytest.mark.asyncio
+async def test_mcp_client_tool_timeout_preserves_session():
+    """Verify tool timeout does not close session or trigger session churn."""
+    client = MCPClient(
+        alias="test_server",
+        transport="sse",
+        url="https://api.verosight.com/v1/mcp/sse",
+        max_retries=3,
+        backoff_s=0.01,
+    )
+
+    mock_client = AsyncMock()
+    mock_client.call_tool.side_effect = TimeoutError("Timed out while waiting for response to ClientRequest.")
+
+    client._client = mock_client
+    client._is_connected = True
+
+    with patch.object(client, "close", new_callable=AsyncMock) as mock_close:
+        with pytest.raises(TimeoutError, match="Timed out"):
+            await client.call_tool("get_topics", {})
+
+        # Assert close was NOT called
+        mock_close.assert_not_called()
+        assert client.is_connected is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_connection_error_closes_and_reconnects():
+    """Verify connection error triggers close() and reconnect attempts."""
+    client = MCPClient(
+        alias="test_server",
+        transport="sse",
+        url="https://api.verosight.com/v1/mcp/sse",
+        max_retries=2,
+        backoff_s=0.01,
+    )
+
+    mock_client = AsyncMock()
+    mock_client.call_tool.side_effect = ConnectionError("SSE stream broken")
+
+    client._client = mock_client
+    client._is_connected = True
+
+    with patch.object(client, "close", wraps=client.close) as mock_close, \
+         patch.object(client, "connect", new_callable=AsyncMock) as mock_connect:
+
+        def connect_side_effect():
+            client._client = mock_client
+            client._is_connected = True
+
+        mock_connect.side_effect = connect_side_effect
+
+        with pytest.raises(ConnectionError, match="SSE stream broken"):
+            await client.call_tool("get_topics", {})
+
+        # Assert close was called on connection error
+        assert mock_close.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_call_tool_retry_reconnect_success():
+    """T1 (RECOVERY): Verify call_tool retries on attempt 1 failure and succeeds on attempt 2."""
+    client = MCPClient(
+        alias="test_server",
+        transport="sse",
+        url="https://api.verosight.com/v1/mcp/sse",
+        max_retries=3,
+        backoff_s=0.01,
+    )
+
+    mock_client_fail = AsyncMock()
+    mock_client_fail.call_tool.side_effect = ConnectionError("Transient SSE disconnect")
+
+    expected_result = CallToolResult(
+        content=[TextContent(type="text", text=json.dumps({"topics": ["AI", "Tech"]}))],
+        isError=False,
+    )
+    mock_client_success = AsyncMock()
+    mock_client_success.call_tool.return_value = expected_result
+
+    client._client = mock_client_fail
+    client._is_connected = True
+
+    attempt_counter = 0
+
+    async def mock_connect():
+        nonlocal attempt_counter
+        attempt_counter += 1
+        client._client = mock_client_success
+        client._is_connected = True
+
+    with patch.object(client, "connect", side_effect=mock_connect):
+        res = await client.call_tool("get_topics", {"keyword": "AI"})
+
+    assert res == expected_result
+    assert attempt_counter == 1
+
+
+
 # ---------------------------------------------------------------------------
 # 3. Manager & Caching tests
 # ---------------------------------------------------------------------------

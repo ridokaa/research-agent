@@ -102,11 +102,13 @@ async def test_mcp_live_metadata_ingestion():
     from app.mcp.client import MCPClient
     from app.mcp.manager import MCPManager
 
+    from app.tools.registry import get_registry
+
     manager = MCPManager()
     await manager.connect_all()
-    registry = manager.registry
+    registry = get_registry()
 
-    mcp_tools = registry.get_mcp_tools()
+    mcp_tools = [spec for spec in registry.list_specs() if spec.source == "mcp"]
     if not mcp_tools:
         pytest.skip("Verosight MCP server unavailable or no tools returned")
 

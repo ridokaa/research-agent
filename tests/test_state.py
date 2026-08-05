@@ -261,3 +261,66 @@ async def test_state_and_persistence_3_iterations_simulation(session: AsyncSessi
     assert "verosight_sentiment" in ctx_block
     assert "clock" in ctx_block
     assert "verosight_topics" in ctx_block
+
+
+def test_execution_memory_rich_context_block_time_series() -> None:
+    """Verify rich context block preserves full by_day time series without truncated strings."""
+    memory = ExecutionMemory()
+    by_day_data = {
+        "query": "perang",
+        "by_day": [
+            {"date": "2026-07-28", "posts": 450, "comments": 30},
+            {"date": "2026-07-29", "posts": 510, "comments": 42},
+            {"date": "2026-07-30", "posts": 620, "comments": 55},
+            {"date": "2026-07-31", "posts": 895, "comments": 59},
+            {"date": "2026-08-01", "posts": 621, "comments": 40},
+            {"date": "2026-08-02", "posts": 730, "comments": 61},
+            {"date": "2026-08-03", "posts": 810, "comments": 70},
+        ],
+    }
+    res = ToolResult(
+        tool_name="verosight__get_volume",
+        status="success",
+        data=by_day_data,
+        duration_ms=200,
+    )
+    memory.add(res, iteration=1, arguments={"topic": "perang"})
+
+    block = memory.get_context_block(max_tokens=4000, current_iteration=1, rich=True)
+
+    # All dates and numbers must be present
+    for day in by_day_data["by_day"]:
+        assert day["date"] in block
+        assert str(day["posts"]) in block
+
+    # Must NOT contain '...' in middle of numeric date JSON
+    assert "2026-07-31" in block
+    assert "2026-08-01" in block
+
+
+def test_compact_tool_output_for_llm() -> None:
+    """Verify heavy top_posts and top_profiles are pruned if output exceeds max_bytes."""
+    from app.agent.loop import compact_tool_output_for_llm
+
+    heavy_topics_data = {
+        "total_topics": 20,
+        "topics": [
+            {
+                "name": "Topik A",
+                "post_count": 5000,
+                "top_posts": [{"id": i, "content": "x" * 5000} for i in range(10)],
+                "top_profiles": [{"id": i, "bio": "y" * 2000} for i in range(10)],
+            }
+        ],
+    }
+
+    compacted = compact_tool_output_for_llm(heavy_topics_data, max_bytes=4000)
+
+    # top_posts and top_profiles should be pruned
+    assert "top_posts" not in compacted["topics"][0]
+    assert "top_profiles" not in compacted["topics"][0]
+
+    # Essential aggregate data kept
+    assert compacted["topics"][0]["name"] == "Topik A"
+    assert compacted["topics"][0]["post_count"] == 5000
+

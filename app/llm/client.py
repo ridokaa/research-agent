@@ -60,7 +60,7 @@ log = structlog.get_logger(__name__)
 # Retry helpers
 # ---------------------------------------------------------------------------
 
-_RETRYABLE_STATUS = {429, 500, 502, 503}
+_RETRYABLE_STATUS = {409, 429, 500, 502, 503}
 _NO_RETRY_STATUS = {400, 401, 403, 404}
 
 # Timeout and network errors are also retryable
@@ -475,12 +475,11 @@ class LLMClient:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code
-                if status_code in _NO_RETRY_STATUS:
-                    log.warning(
-                        "llm.non_retryable_error",
-                        status=status_code,
-                        body=exc.response.text[:500],
-                    )
+                log.warning(
+                    "llm.http_status_error",
+                    status=status_code,
+                    body=exc.response.text[:500],
+                )
                 raise  # tenacity checks _is_retryable
 
             text = resp.text.strip()

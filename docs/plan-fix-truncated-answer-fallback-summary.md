@@ -1,5 +1,11 @@
 # Rencana Perbaikan — Jawaban Masih "(terpotong)" Meski `TOOL_RESULT_PASSTHROUGH=true`
 
+> **⚠️ SUPERSEDED (2026-08-04).** Digantikan oleh **`docs/plan-fix-synthesis-right-sizing.md`**,
+> yang mengonsolidasikan masalah "(terpotong)" ini bersama akar empty-synthesis (ukuran konteks).
+> Prinsip perbaikannya sama — "buang noise, simpan semua fakta (`by_day`/agregat/topik)" — kini
+> dirumuskan lengkap di dokumen pengganti. Dokumen ini disimpan sebagai riwayat. **Untuk
+> implementasi, ikuti dokumen pengganti.**
+
 > **Dokumen rencana untuk agen eksekutor.** Menjelaskan mengapa jawaban akhir masih menandai
 > data `*(terpotong)*` walau data tool sebenarnya lengkap, dan cara memperbaikinya. Audit pada
 > branch `retrofit/chat-completions-adapter` (2026-08-04), berbasis run nyata

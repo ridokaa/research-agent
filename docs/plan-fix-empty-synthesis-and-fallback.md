@@ -1,5 +1,11 @@
 # Rencana Perbaikan — Respons Kosong saat Sintesis (chat mode) & Fallback yang Membuang Data
 
+> **⚠️ SUPERSEDED (2026-08-04).** Digantikan oleh **`docs/plan-fix-synthesis-right-sizing.md`**,
+> yang mengonsolidasikan masalah ini beserta penyebab **baru** (ukuran konteks ~45k token) dan
+> masalah "(terpotong)". Dokumen ini disimpan sebagai riwayat: TASK A1 (urutan pesan chat) **sudah
+> diterapkan** (`app/agent/loop.py:289`); penyebab tersisa (ukuran konteks) ditangani di dokumen
+> pengganti. **Untuk implementasi, ikuti dokumen pengganti.**
+
 > **Dokumen rencana untuk agen eksekutor.** Dua bug yang membuat agen **membuang data yang sudah
 > berhasil dikumpulkannya sendiri** lalu menjawab "tidak ada data". Audit pada branch
 > `retrofit/chat-completions-adapter` (2026-08-03). Patuhi aturan global `docs/PROMPT_PLAN.md`

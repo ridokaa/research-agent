@@ -83,6 +83,17 @@ _SECRET_VALUE_PATTERNS = [
 ]
 
 
+_ALLOWLIST_KEYS: set[str] = {
+    "keyword",
+    "keywords",
+    "key",
+    "tokens",
+    "token_in",
+    "token_out",
+    "query",
+}
+
+
 def _redact(obj: Any, _depth: int = 0) -> Any:
     """Recursively redact sensitive keys and values in a nested structure."""
     if _depth > 10:
@@ -96,17 +107,15 @@ def _redact(obj: Any, _depth: int = 0) -> Any:
         out: dict[str, Any] = {}
         for k, v in obj.items():
             k_lower = k.lower() if isinstance(k, str) else ""
-            is_secret_key = (
-                _REDACT_PATTERN.fullmatch(k_lower)
-                or "secret" in k_lower
-                or (
-                    ("token" in k_lower or "auth" in k_lower or "key" in k_lower)
-                    and not k_lower.endswith("tokens")
-                    and "token_in" not in k_lower
-                    and "token_out" not in k_lower
-                    and k_lower != "tokens"
+            if k_lower in _ALLOWLIST_KEYS:
+                is_secret_key = False
+            else:
+                is_secret_key = bool(
+                    _REDACT_PATTERN.fullmatch(k_lower)
+                    or "secret" in k_lower
+                    or k_lower.endswith(("_key", "_token", "_secret", "_password", "_passwd", "_auth"))
+                    or k_lower.startswith(("x-api", "api_key", "access_token", "refresh_token", "secret_", "auth_"))
                 )
-            )
             if is_secret_key:
                 out[k] = "***"
             else:

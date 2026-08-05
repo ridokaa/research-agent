@@ -20,6 +20,7 @@ from app.agent.state import (
     AgentState,
     ConversationHistory,
     Message,
+    compact_tool_output_for_llm,
     persist_execution_memory_snapshot,
 )
 from app.config import get_settings
@@ -165,6 +166,7 @@ class AgentLoop:
         pending_inputs: list[dict[str, Any]] = []
         no_progress_count: int = 0
         final_answer: str | None = None
+        synthesis_mode: bool = False
 
         try:
             while True:
@@ -198,6 +200,16 @@ class AgentLoop:
                 instructions, llm_input = self.planner.build_request(
                     state, pending_inputs=pending_inputs, store=opts.store
                 )
+
+                # Synthesis mode: right-size context BEFORE the call so the model
+                # produces text (never the oversized-context empty) and flows into self-check.
+                if synthesis_mode and state.execution_memory:
+                    mem_block = state.execution_memory.get_context_block(
+                        max_tokens=4000, current_iteration=state.iteration, rich=True
+                    )
+                    if mem_block:
+                        llm_input = self.planner.build_synthesis_input(state.user_query, mem_block)
+
                 tracer.event(
                     "context_built",
                     f"Built request context for iteration {state.iteration}",
@@ -205,6 +217,7 @@ class AgentLoop:
                         "iteration": state.iteration,
                         "has_previous_id": state.last_response_id is not None,
                         "memory_items_count": len(state.execution_memory),
+                        "synthesis_mode": synthesis_mode,
                     },
                 )
 
@@ -216,12 +229,28 @@ class AgentLoop:
                         tools_allow=opts.tools_allow,
                         tools_deny=opts.tools_deny,
                     )
+                    effective_tools = None if synthesis_mode else (tools_def if tools_def else None)
+                    prev_id = None if synthesis_mode else (state.last_response_id if opts.store else None)
                     response = await llm.respond(
                         input=llm_input,
                         instructions=instructions,
-                        tools=tools_def if tools_def else None,
-                        previous_response_id=state.last_response_id if opts.store else None,
+                        tools=effective_tools,
+                        previous_response_id=prev_id,
                     )
+                    MAX_EMPTY_RETRY = 2
+                    attempts = 0
+                    while (not response.function_calls and not response.output_text) and attempts < MAX_EMPTY_RETRY:
+                        attempts += 1
+                        tracer.event(
+                            "thinking",
+                            f"LLM returned empty response (flake provider); retrying attempt {attempts}/{MAX_EMPTY_RETRY}",
+                        )
+                        response = await llm.respond(
+                            input=llm_input,
+                            instructions=instructions,
+                            tools=effective_tools,
+                            previous_response_id=prev_id,
+                        )
                 except LLMError as err:
                     state.status = "failed"
                     tracer.event(
@@ -373,6 +402,7 @@ class AgentLoop:
                         )
 
                     await tracer.flush()
+                    synthesis_mode = True
                     continue
 
                 # --- 4. Handle Final Text Output & Self-Check ---
@@ -425,6 +455,7 @@ class AgentLoop:
                     )
                     pending_inputs.append(reflection_msg)
                     no_progress_count += 1
+                    synthesis_mode = False
 
                     if self.session is not None:
                         if conv_history is not None:
@@ -450,30 +481,48 @@ class AgentLoop:
                 mem_block = state.execution_memory.get_context_block(
                     max_tokens=2000, current_iteration=state.iteration
                 )
-                fallback_prompt = self.planner.build_fallback_prompt(user_query, mem_block)
-                try:
-                    fallback_resp = await llm.respond(
-                        input=fallback_prompt,
-                        instructions="Kamu adalah agen riset. Jawab sejujurnya berdasarkan data yang ada dan sebutkan keterbatasannya. JANGAN mengarang data.",
-                    )
-                    final_answer = (
-                        fallback_resp.output_text
-                        or "Tidak dapat memperoleh jawaban lengkap dari data tool yang tersedia."
-                    )
-                except Exception as exc:
-                    if mem_block:
-                        final_answer = f"Berdasarkan data yang terkumpul: {mem_block[:300]} (keterbatasan: iterasi/budget habis)."
-                    else:
-                        final_answer = f"Informasi tidak cukup untuk menjawab secara lengkap ({exc})."
+                if state.execution_memory:
+                    fallback_prompt = self.planner.build_fallback_prompt(user_query, mem_block)
+                    try:
+                        fallback_resp = await llm.respond(
+                            input=fallback_prompt,
+                            instructions="Kamu adalah agen riset. Jawab sejujurnya berdasarkan data yang ada dan sebutkan keterbatasannya. JANGAN mengarang data.",
+                        )
+                        final_answer = (
+                            fallback_resp.output_text
+                            or "Tidak dapat memperoleh jawaban lengkap dari data tool yang tersedia."
+                        )
+                    except Exception as exc:
+                        if mem_block:
+                            final_answer = f"Berdasarkan data yang terkumpul: {mem_block[:300]} (keterbatasan: iterasi/budget habis)."
+                        else:
+                            final_answer = f"Informasi tidak cukup untuk menjawab secara lengkap ({exc})."
 
-                if state.status == "running":
-                    state.status = "success" if final_answer else "exhausted"
+                    if state.status == "running":
+                        state.status = "success" if final_answer else "exhausted"
 
-                tracer.event(
-                    "final_answer",
-                    f"Fallback answer generated (status={state.status})",
-                    payload={"answer": final_answer, "status": state.status},
-                )
+                    tracer.event(
+                        "final_answer",
+                        f"Fallback answer generated (status={state.status})",
+                        payload={"answer": final_answer, "status": state.status},
+                    )
+                else:
+                    state.status = "failed"
+                    final_answer = "Run failed: Provider mengembalikan respons kosong berulang tanpa data."
+                    tracer.event(
+                        "error",
+                        "LLM returned empty response repeatedly with no execution memory",
+                        payload=ErrorReport(
+                            component="llm",
+                            stage="empty_response",
+                            message="Provider mengembalikan respons kosong berulang",
+                        ).model_dump(),
+                    )
+                    tracer.event(
+                        "final_answer",
+                        f"Empty fallback (status={state.status})",
+                        payload={"answer": final_answer, "status": state.status},
+                    )
 
         except Exception as exc:
             state.status = "failed"
