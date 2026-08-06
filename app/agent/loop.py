@@ -357,6 +357,7 @@ class AgentLoop:
                             tracer=tracer,
                             run_id=run_id,
                             db_session=self.session,
+                            user_query=state.user_query,
                         )
 
                         for (fc, args_tuple), res in zip(uncached_calls, results):

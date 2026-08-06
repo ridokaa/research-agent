@@ -181,6 +181,44 @@ class ToolExecutor:
 
         return new_args
 
+    def _normalize_platform_arguments(
+        self, tool: Any, args_dict: dict[str, Any], user_query: str | None = None
+    ) -> dict[str, Any]:
+        """Strip 'platform' parameter if model over-constrained it and user query did NOT mention a platform.
+
+        Intent detection:
+        - Checks user_query (lowercase) for explicit platform mentions ('tiktok', 'twitter', 'instagram',
+          'facebook', 'youtube', 'threads', etc. or explicit 'x' patterns like 'di x', 'platform x', 'twitter/x').
+        - If 'platform' is present in args_dict but user_query is provided and does not mention any platform,
+          remove 'platform' from args_dict.
+        """
+        if not args_dict or "platform" not in args_dict:
+            return args_dict
+
+        params_props = tool.spec.parameters.get("properties", {}) if tool.spec and tool.spec.parameters else {}
+        if "platform" not in params_props:
+            return args_dict
+
+        if user_query is None or not user_query.strip():
+            return args_dict
+
+        q = user_query.lower()
+        explicit_platforms = ["tiktok", "twitter", "instagram", "facebook", "youtube", "threads", "linkedin", "reddit"]
+        has_platform_mention = any(p in q for p in explicit_platforms)
+
+        if not has_platform_mention:
+            # Check for explicit 'x' patterns
+            import re
+            if re.search(r"\b(di\s+x|platform\s+x|twitter/x|x/twitter)\b", q):
+                has_platform_mention = True
+
+        if not has_platform_mention:
+            new_args = dict(args_dict)
+            new_args.pop("platform", None)
+            return new_args
+
+        return args_dict
+
     async def execute(
         self,
         name: str,
@@ -189,6 +227,7 @@ class ToolExecutor:
         run_id: UUID | None = None,
         step_seq: int | None = None,
         db_session: AsyncSession | None = None,
+        user_query: str | None = None,
     ) -> ToolResult:
         """Execute a tool by name with argument validation, timeout, and retries.
 
@@ -240,6 +279,9 @@ class ToolExecutor:
 
         # System-level date normalization (schema-driven date_from / date_to handling)
         args_dict = self._normalize_date_arguments(tool, args_dict)
+
+        # Platform normalization (strip platform if not mentioned in user_query)
+        args_dict = self._normalize_platform_arguments(tool, args_dict, user_query=user_query)
 
         # Validate arguments against tool spec JSON Schema
         try:
@@ -403,6 +445,7 @@ class ToolExecutor:
         run_id: UUID | None = None,
         step_seq: int | None = None,
         db_session: AsyncSession | None = None,
+        user_query: str | None = None,
     ) -> list[ToolResult]:
         """Execute multiple tool calls sequentially or in parallel."""
         settings = get_settings()
@@ -415,6 +458,7 @@ class ToolExecutor:
                     run_id=run_id,
                     step_seq=step_seq,
                     db_session=None,
+                    user_query=user_query,
                 )
                 for name, args in calls
             ]
@@ -462,6 +506,7 @@ class ToolExecutor:
                 run_id=run_id,
                 step_seq=step_seq,
                 db_session=db_session,
+                user_query=user_query,
             )
             results.append(res)
         return results

@@ -386,6 +386,42 @@ def test_builtin_db_query_sql_validation():
     with pytest.raises(ValueError, match="forbidden"):
         _validate_sql_query("SELECT * FROM pg_user")
 
+
+def test_normalize_platform_arguments():
+    executor = ToolExecutor()
+
+    class MockTool:
+        spec = ToolSpec(
+            name="search_posts",
+            description="search posts",
+            parameters={"type": "object", "properties": {"keyword": {"type": "str"}, "platform": {"type": "str"}}},
+            source="verosight",
+        )
+
+    tool = MockTool()
+
+    # Query without platform mention -> platform is stripped
+    args1 = {"keyword": "nuklir", "platform": "x"}
+    res1 = executor._normalize_platform_arguments(tool, args1, user_query="apakah nuklir sering dibicarakan?")
+    assert "platform" not in res1
+    assert res1["keyword"] == "nuklir"
+
+    # Query with explicit platform mention ('tiktok') -> platform preserved
+    args2 = {"keyword": "nuklir", "platform": "tiktok"}
+    res2 = executor._normalize_platform_arguments(tool, args2, user_query="apa yang viral soal nuklir di TikTok?")
+    assert res2.get("platform") == "tiktok"
+
+    # Query with explicit 'di x' mention -> platform preserved
+    args3 = {"keyword": "nuklir", "platform": "x"}
+    res3 = executor._normalize_platform_arguments(tool, args3, user_query="apa rumor nuklir di x?")
+    assert res3.get("platform") == "x"
+
+    # Query without user_query -> platform preserved (no strip if query unknown)
+    args4 = {"keyword": "nuklir", "platform": "x"}
+    res4 = executor._normalize_platform_arguments(tool, args4, user_query=None)
+    assert res4.get("platform") == "x"
+
+
     # Multi-statement rejection
     with pytest.raises(ValueError, match="Multi-statement"):
         _validate_sql_query("SELECT 1; SELECT 2;")
