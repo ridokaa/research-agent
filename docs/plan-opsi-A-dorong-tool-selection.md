@@ -1,26 +1,33 @@
-# [OPSI-A] Plan — Dorong Pemilihan Tool + Perketat Self-Check (prompt-only, 100% reversibel)
+# [OPSI-A'] Plan v2 — Dorong Pemilihan Tool + Self-Check BERSYARAT (prompt-only, 100% reversibel)
 
-> **Dokumen rencana untuk agen eksekutor.** Tujuan: membuat model **memanggil dimensi yang benar**
-> (volume + sentimen + pemicu) untuk pertanyaan signifikansi topik, dan membuat **self-check menolak**
-> jawaban yang melewatkannya. **Hanya perubahan teks prompt** (`system.md`, `finalize.md`) →
-> **100% reversibel via git**, tak menyentuh kode/struktur. Upaya murah TERAKHIR sebelum keputusan model
-> (Jalur B). Audit branch `retrofit/chat-completions-adapter` (2026-08-06). Patuhi `docs/PROMPT_PLAN.md` §1.6.
+> **Dokumen rencana untuk agen eksekutor. VERSI 2** — menyempurnakan Opsi A v1 yang sudah dijalankan &
+> di-revert. Tujuan: membuat model **memanggil dimensi yang benar** (volume + sentimen + pemicu) untuk
+> pertanyaan **signifikansi/analisis**, TANPA memaksa dimensi ekstra pada pertanyaan **faktual sederhana**.
+> **Hanya perubahan teks prompt** (`system.md`, `finalize.md`) → **100% reversibel via git**, tak menyentuh
+> kode/struktur. Audit branch `retrofit/chat-completions-adapter` (2026-08-06). Patuhi `docs/PROMPT_PLAN.md` §1.6.
 
 ---
 
-## 1. Masalah (dari run `79c3bd74`, 2026-08-06)
+## 1. Masalah & Hasil Eksekusi v1 (BUKTI)
 
-Setelah fix platform + tool mati berhasil, model gpt-5.6-terra **tetap** memilih hanya tool volume
-(`get_keyword_volume` x2 + `get_volume`), **melewatkan** `get_sentiment` & `search_posts` (yang TERBUKTI
-mengembalikan pemicu viral). Self-check (CT1) **meloloskan** jawaban tipis ini (`is_final=True`).
+**Konteks awal (run `79c3bd74`):** gpt-5.6-terra memilih hanya tool volume, melewatkan `get_sentiment` &
+`search_posts`; self-check meloloskan jawaban tipis.
 
-`system.md` **sudah** menyuruh "utamakan `search_posts`" (baris 18) & memakai sentimen — **model
-mengabaikannya**. Jadi panduan yang ada **kurang tegas/spesifik** untuk pola "apakah X sering dibicarakan".
-Ini penilaian model; satu-satunya lever prompt-only = **buat panduan lebih eksplisit & jadikan self-check
-lebih menuntut**.
+**Hasil Opsi A v1 (dijalankan agen, 2026-08-06) — SEBAGIAN BESAR BERHASIL:**
+- ✅ Run 1 & 2 ("apakah nuklir sering dibicarakan"): model memanggil **3 dimensi** (volume + sentimen +
+  `search_posts` sort=like_count) → jawaban **kaya** memuat **pemicu spesifik** (pidato Prabowo soal nuklir
+  Iran & siaran terputus) + sentimen. **Ini target yang selama ini dikejar — tercapai.**
+- ✅ Run 3 (IKN): saat 1 tool 400, **self-check memicu refleksi** (`is_final=false`) → gather ulang. Bekerja.
+- ❌ **Efek samping (satu-satunya):** pertanyaan **faktual sederhana** ("berapa volume bbm minggu ini?") →
+  `finalize.md` v1 (tanpa syarat) **menolak** jawaban ringkas yang benar → memaksa `search_posts` hingga
+  iter-8 (`exhausted`). **Over-gather.**
 
-**Sifat & batas:** ini menyetir model, **tanpa jaminan** (model bisa tetap abai). Bila gagal → itu bukti
-tegas untuk **Jalur B (model lebih mampu)**. Perubahan ini **reversibel penuh**.
+**Akar efek samping:** aturan `finalize.md` v1 menuntut sentimen/search_posts untuk **SEMUA** pertanyaan,
+termasuk faktual sederhana. **Perbaikan v2: buat aturan itu BERSYARAT** — hanya untuk pertanyaan
+signifikansi/analisis; kecualikan faktual sederhana. Simpan kemenangan, buang over-gather.
+
+**Sifat & batas:** tetap menyetir model, tanpa jaminan sempurna. Bila v2 masih perlu tuning tanpa henti /
+tetap over-gather → itu bukti tegas untuk **Jalur B (model lebih mampu)**. Perubahan ini **reversibel penuh**.
 
 ---
 
@@ -34,14 +41,19 @@ Tambah panduan konkret (di bagian "Cara kerja" atau "Panduan memakai tool pencar
 > Panggil ketiganya **paralel di awal**, kecuali salah satu jelas tak relevan. **Jangan berhenti hanya pada
 > volume.**"
 
-**Perubahan 2 — `app/agent/prompts/finalize.md`: self-check menuntut dimensi kunci.**
-Tambah satu poin ke kriteria (tetap kondisional, memakai daftar tool BELUM dipanggil yang sudah tersedia
-sejak CT1):
-> "Untuk pertanyaan tentang topik/isu/opini publik: bila `get_sentiment` ATAU `search_posts`/`semantic_search`
-> termasuk tool yang BELUM dipanggil dan jelas relevan dengan pertanyaan, set `is_final=false` dan sebut tool
-> itu di `missing`."
+**Perubahan 2 — `app/agent/prompts/finalize.md`: self-check menuntut dimensi kunci, TAPI BERSYARAT (KUNCI v2).**
+Tambah poin ke kriteria — **dengan pengecualian eksplisit untuk pertanyaan faktual sederhana** (inilah
+perbaikan atas efek samping v1):
+> "**KLASIFIKASIKAN dulu jenis pertanyaan:**
+> - **Faktual sederhana** (mis. 'berapa volume/jumlah X?', 'kapan puncaknya?') → jangan menuntut dimensi
+>   ekstra. Bila angka yang diminta sudah ada di data → **`is_final=true`**. JANGAN paksa sentimen/search_posts.
+> - **Signifikansi/analisis/opini** (mis. 'apakah X sering dibicarakan?', 'seberapa penting/viral X?',
+>   'bagaimana tanggapan publik?') → bila `get_sentiment` ATAU `search_posts`/`semantic_search` termasuk tool
+>   yang BELUM dipanggil dan jelas relevan, set **`is_final=false`** dan sebut tool itu di `missing`."
 
 Guard anti-loop yang sudah ada (`missing in executed_tools → is_final=true`; iterasi mepet) mencegah loop.
+**Perubahan 1 (`system.md`) sudah menyasar hanya "pertanyaan signifikansi topik" — biarkan; tak menyebabkan
+over-gather karena resepnya kondisional.**
 
 ---
 
@@ -56,12 +68,13 @@ Guard anti-loop yang sudah ada (`missing in executed_tools → is_final=true`; i
 - Catatan: tak ada unit test perilaku (ini output LLM) — test struktural yang ada tetap harus **hijau**
   (perubahan prompt tak boleh memecahkannya; jalankan suite untuk memastikan).
 
-### Tahap 2 — Uji ≥3 run (gerbang perilaku)
-- Query campuran, termasuk "apakah nuklir sering dibicarakan akhir-akhir ini?".
-- **Kriteria BERHASIL:** model memanggil `get_sentiment` **dan** `search_posts` (bukan hanya volume);
-  jawaban memuat **sentimen** + **pemicu/substansi** (mis. pidato Prabowo viral). Bila kurang, self-check
-  memicu refleksi (`is_final=false`, log `reflection`) lalu gather ulang.
-- **Pantau:** tak over-gather untuk pertanyaan sederhana; latensi/biaya wajar; tak loop.
+### Tahap 2 — Uji ≥3 run (gerbang perilaku) — WAJIB mencakup DUA jenis pertanyaan
+- **(a) Signifikansi** (mis. "apakah nuklir sering dibicarakan akhir-akhir ini?"): model memanggil
+  `get_sentiment` **dan** `search_posts`; jawaban memuat **sentimen** + **pemicu** (mis. pidato Prabowo).
+- **(b) Faktual sederhana** (mis. "berapa volume percakapan bbm minggu ini?"): jawaban **ringkas & cepat**
+  (1-2 iterasi); self-check **`is_final=true`** setelah angka diperoleh. **TIDAK boleh over-gather** /
+  memaksa `search_posts` / `exhausted`. ← Ini kontrol utama perbaikan v2.
+- **Pantau:** latensi/biaya wajar; tak loop.
 
 ### Tahap 3 — Putuskan
 - **Membaik & konsisten (≥3 run)** → simpan; commit sebagai checkpoint.
@@ -91,8 +104,10 @@ Guard anti-loop yang sudah ada (`missing in executed_tools → is_final=true`; i
 - **RS2 — Trade-off fleksibilitas.** Resep "panggil 3 dimensi" mendekati rubrik yang dulu Anda tolak; ia
   menaikkan konsistensi tapi sedikit mengurangi keleluasaan model. "kecuali jelas tak relevan" menjaga
   sebagian fleksibilitas. Bila terasa terlalu kaku → revert.
-- **RS3 — Risiko over-gather.** Menuntut 3 dimensi bisa membuat pertanyaan sederhana jadi boros. Gerbang uji
-  (b) query sederhana adalah kontrolnya.
+- **RS3 — Over-gather (TERJADI di v1, DITANGANI di v2).** v1 memaksa dimensi untuk semua pertanyaan →
+  pertanyaan sederhana "bbm" over-gather sampai `exhausted`. v2 memakai `finalize.md` **bersyarat**
+  (klasifikasi faktual vs signifikansi). Gerbang uji (b) adalah kontrol wajibnya. Bila v2 MASIH over-gather
+  pada (b) → berarti model gagal mengklasifikasi jenis pertanyaan → **sinyal kuat Jalur B**.
 - **RS4 — Reversibilitas.** 100% via git (prompt-only). Test struktural (synthesis/CT1/tanggal) melindungi
   kode inti — perubahan prompt tak bisa meregresinya.
 - **Rujukan:** `docs/plan-agen-lebih-cerdas.md`, `docs/plan-fix-platform-overconstraint-dead-tool.md`,
