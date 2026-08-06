@@ -160,6 +160,15 @@ def test_tools_disabled_config_filter():
         names = [s.name for s in specs]
         assert "tool_a" not in names
         assert "tool_b" in names
+        responses_names = [t["name"] for t in registry.to_responses_tools()]
+        assert "tool_a" not in responses_names
+        assert "tool_b" in responses_names
+        chat_names = [t["function"]["name"] for t in registry.to_chat_tools()]
+        assert "tool_a" not in chat_names
+        assert "tool_b" in chat_names
+        to_tools_names = [t["function"]["name"] for t in registry.to_tools("chat_completions")]
+        assert "tool_a" not in to_tools_names
+        assert "tool_b" in to_tools_names
 
 
 def test_auto_discovery():

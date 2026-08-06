@@ -74,7 +74,9 @@ class Settings(BaseSettings):
     TOOL_RESULT_PASSTHROUGH: bool = True
     AGENT_TIMEZONE: str = "Asia/Jakarta"
     AGENT_DEFAULT_WINDOW_DAYS: int = Field(default=30, ge=1)
-    TOOLS_DISABLED: list[str] = Field(default_factory=list)
+    TOOLS_DISABLED: list[str] = Field(
+        default_factory=lambda: ["verosight__get_share_of_voice"]
+    )
 
     @field_validator("TOOLS_DISABLED", mode="before")
     @classmethod
