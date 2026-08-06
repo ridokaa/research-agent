@@ -258,3 +258,106 @@ async def test_proactive_synthesis_right_sizing_triggers_self_check():
     assert agent.last_state.iteration == 2
 
 
+class _CapturingLLMClient(DummyLLMClient):
+    """DummyLLMClient that records the input of self-check calls (text_format set)."""
+
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        super().__init__(responses)
+        self.self_check_inputs: list[Any] = []
+
+    async def respond(
+        self,
+        input: str | list[dict[str, Any]],
+        *,
+        instructions: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] = "auto",
+        previous_response_id: str | None = None,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+        text_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        if text_format is not None:  # the self-check call is the only json_object call
+            self.self_check_inputs.append(input)
+        return await super().respond(
+            input,
+            instructions=instructions,
+            tools=tools,
+            tool_choice=tool_choice,
+            previous_response_id=previous_response_id,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            text_format=text_format,
+        )
+
+
+class _SentimentTool(BaseTool):
+    spec = ToolSpec(
+        name="verosight__get_sentiment",
+        description="Sentiment tool (not called in this test)",
+        source="local",
+        parameters={"type": "object", "properties": {}},
+    )
+
+    async def run(self, **kwargs: Any) -> dict[str, Any]:
+        return {"positive": 10, "negative": 5, "neutral": 20}
+
+
+@pytest.mark.asyncio
+async def test_self_check_receives_executed_and_available_tools():
+    """CT1 regression lock: the LOOP must pass executed_tools + available_tools into the self-check.
+
+    Guards against the regression where loop.py called build_finalize_input without tool
+    availability (simplified self-check), letting thin answers pass is_final=True.
+    """
+    from app.tools.executor import ToolExecutor
+    from app.llm.schemas import FunctionCall
+
+    registry = ToolRegistry()
+    registry.register(HeavyAggregateTool())  # verosight__get_topics -> WILL be called
+    registry.register(_SentimentTool())      # verosight__get_sentiment -> NOT called (available)
+    executor = ToolExecutor(registry=registry)
+
+    resp1 = LLMResponse(
+        response_id="resp-1",
+        output_text=None,
+        function_calls=[FunctionCall(call_id="c1", name="verosight__get_topics", arguments_dict={})],
+        status="completed",
+        incomplete_reason=None,
+        usage=UsageInfo(10, 10),
+        raw={},
+    )
+    resp2_synth = LLMResponse(
+        response_id="resp-2",
+        output_text="Ringkasan berdasarkan data topik nuklir.",
+        function_calls=[],
+        status="completed",
+        incomplete_reason=None,
+        usage=UsageInfo(10, 10),
+        raw={},
+    )
+    resp3_selfcheck = LLMResponse(
+        response_id="resp-3",
+        output_text=json.dumps({"is_final": True, "reason": "ok"}),
+        function_calls=[],
+        status="completed",
+        incomplete_reason=None,
+        usage=UsageInfo(10, 10),
+        raw={},
+    )
+
+    llm = _CapturingLLMClient([resp1, resp2_synth, resp3_selfcheck])
+    agent = AgentLoop(llm_client=llm, registry=registry, executor=executor)
+    res = await agent.run(user_query="Bahas topik nuklir", options=RunOptions(store=False))
+
+    assert res.status == "success"
+    assert llm.self_check_inputs, "self-check was never invoked"
+    finalize_input = llm.self_check_inputs[0]
+    assert isinstance(finalize_input, str)
+    # executed tool must be listed
+    assert "--- Tool yang SUDAH Dipanggil ---" in finalize_input
+    assert "verosight__get_topics" in finalize_input
+    # available (not-yet-called) tool must be listed so self-check can require gathering it
+    assert "--- Tool TERSEDIA yang BELUM Dipanggil ---" in finalize_input
+    assert "verosight__get_sentiment" in finalize_input
+

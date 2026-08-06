@@ -409,11 +409,19 @@ class AgentLoop:
                 if response.output_text and not response.function_calls:
                     draft_answer = response.output_text
 
-                    # Execute self-check using finalize.md
+                    # Execute self-check using finalize.md (rich context + tool availability)
                     mem_block = state.execution_memory.get_context_block(
-                        max_tokens=2000, current_iteration=state.iteration
+                        max_tokens=4000, current_iteration=state.iteration, rich=True
                     )
-                    finalize_input = self.planner.build_finalize_input(draft_answer, mem_block)
+                    executed_tools = list({item.origin_tool for item in state.execution_memory.items})
+                    all_tools = [s.name for s in registry.list_specs()] if registry else []
+                    available_tools = [t for t in all_tools if t not in executed_tools]
+                    finalize_input = self.planner.build_finalize_input(
+                        draft_answer,
+                        mem_block,
+                        executed_tools=executed_tools,
+                        available_tools=available_tools,
+                    )
 
                     is_final = True
                     reason = ""
@@ -430,6 +438,16 @@ class AgentLoop:
                             is_final = bool(eval_data.get("is_final", True))
                             reason = str(eval_data.get("reason", ""))
                             missing = str(eval_data.get("missing", "") or "")
+
+                            # Anti-loop guard: don't force re-gather for an already-tried tool
+                            # or when iterations are nearly exhausted.
+                            if not is_final:
+                                if missing and missing in executed_tools:
+                                    log.info("agent_loop.self_check_override_already_executed", tool=missing)
+                                    is_final = True
+                                elif state.iteration >= state.max_iterations - 1:
+                                    log.info("agent_loop.self_check_override_max_iterations", iteration=state.iteration)
+                                    is_final = True
                     except Exception as err:
                         log.warning("agent_loop.self_check_failed", error=str(err))
                         is_final = True
