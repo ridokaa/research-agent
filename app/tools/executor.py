@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
+import zoneinfo
 
 import httpx
 import jsonschema
@@ -112,6 +114,73 @@ class ToolExecutor:
     def registry(self) -> ToolRegistry:
         return self._registry
 
+    def _normalize_date_arguments(self, tool: Any, args_dict: dict[str, Any]) -> dict[str, Any]:
+        """Normalize date_from and date_to parameters deterministically based on tool schema.
+
+        - Uses system date from AGENT_TIMEZONE (default Asia/Jakarta).
+        - If date_from and date_to are missing/empty, populates default recent window (AGENT_DEFAULT_WINDOW_DAYS).
+        - Clamps future date_to to today.
+        - Ensures date_from <= date_to.
+        """
+        params_props = tool.spec.parameters.get("properties", {}) if tool.spec and tool.spec.parameters else {}
+        has_date_from = "date_from" in params_props
+        has_date_to = "date_to" in params_props
+
+        if not (has_date_from or has_date_to):
+            return args_dict
+
+        new_args = dict(args_dict)
+
+        settings = get_settings()
+        try:
+            tz = zoneinfo.ZoneInfo(settings.AGENT_TIMEZONE)
+        except Exception:
+            tz = UTC
+
+        today = datetime.now(tz=tz).date()
+        default_days = settings.AGENT_DEFAULT_WINDOW_DAYS
+
+        val_from_str = new_args.get("date_from")
+        val_to_str = new_args.get("date_to")
+
+        val_from = None
+        if val_from_str and isinstance(val_from_str, str):
+            try:
+                val_from = datetime.strptime(val_from_str.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        val_to = None
+        if val_to_str and isinstance(val_to_str, str):
+            try:
+                val_to = datetime.strptime(val_to_str.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        # Aturan 1: Jika keduanya kosong -> default recent window
+        if val_from is None and val_to is None:
+            val_to = today
+            val_from = today - timedelta(days=default_days)
+        elif val_from is not None and val_to is None:
+            val_to = today
+        elif val_from is None and val_to is not None:
+            val_from = val_to - timedelta(days=default_days)
+
+        # Aturan 2: Bila date_to di masa depan -> clamp ke today
+        if val_to > today:
+            val_to = today
+
+        # Aturan 3: Bila date_from > date_to -> perbaiki
+        if val_from > val_to:
+            val_from = max(val_to - timedelta(days=default_days), datetime.min.date())
+
+        if has_date_from or "date_from" in new_args or val_from_str is not None:
+            new_args["date_from"] = val_from.strftime("%Y-%m-%d")
+        if has_date_to or "date_to" in new_args or val_to_str is not None:
+            new_args["date_to"] = val_to.strftime("%Y-%m-%d")
+
+        return new_args
+
     async def execute(
         self,
         name: str,
@@ -168,6 +237,9 @@ class ToolExecutor:
                 return res
         else:
             args_dict = arguments or {}
+
+        # System-level date normalization (schema-driven date_from / date_to handling)
+        args_dict = self._normalize_date_arguments(tool, args_dict)
 
         # Validate arguments against tool spec JSON Schema
         try:

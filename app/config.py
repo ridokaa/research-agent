@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     AGENT_CREDITS_BUDGET: int = Field(default=100, ge=0)
     AGENT_PARALLEL_TOOLS: bool = True
     TOOL_RESULT_PASSTHROUGH: bool = True
+    AGENT_TIMEZONE: str = "Asia/Jakarta"
+    AGENT_DEFAULT_WINDOW_DAYS: int = Field(default=30, ge=1)
     TOOLS_DISABLED: list[str] = Field(default_factory=list)
 
     @field_validator("TOOLS_DISABLED", mode="before")

@@ -128,8 +128,20 @@ def to_chat_messages(
             if raw_tc:
                 tool_calls = []
                 for tc in raw_tc:
-                    if isinstance(tc, dict):
+                    if isinstance(tc, dict) and "id" in tc and "function" in tc:
                         tool_calls.append(tc)
+                    elif isinstance(tc, dict):
+                        tc_id = tc.get("id") or tc.get("call_id", "")
+                        tc_name = tc.get("name") or (tc.get("function", {}).get("name", "") if isinstance(tc.get("function"), dict) else "")
+                        tc_args = tc.get("arguments") if "arguments" in tc else tc.get("arguments_dict")
+                        if tc_args is None and isinstance(tc.get("function"), dict):
+                            tc_args = tc.get("function", {}).get("arguments", {})
+                        args_str = json.dumps(tc_args) if isinstance(tc_args, dict) else str(tc_args or "{}")
+                        tool_calls.append({
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {"name": tc_name, "arguments": args_str},
+                        })
                     elif hasattr(tc, "id") or hasattr(tc, "call_id"):
                         tc_id = getattr(tc, "id", getattr(tc, "call_id", ""))
                         tc_name = getattr(tc, "name", "")

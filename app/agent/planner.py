@@ -36,12 +36,25 @@ class Planner:
         if not mem_block:
             mem_block = "(Belum ada data dari tool)"
 
+        from datetime import datetime, UTC
+        import zoneinfo
+        from app.config import get_settings
+
+        settings = get_settings()
+        try:
+            tz = zoneinfo.ZoneInfo(settings.AGENT_TIMEZONE)
+        except Exception:
+            tz = UTC
+
+        current_date_str = datetime.now(tz=tz).strftime("%A, %d %B %Y")
+
         return self._system_template.format(
             iteration=state.iteration,
             max_iterations=state.max_iterations,
             credits_used=state.credits_used,
             credits_budget=state.credits_budget,
             execution_memory=mem_block,
+            current_date=current_date_str,
         )
 
     def build_request(

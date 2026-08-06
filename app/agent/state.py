@@ -36,6 +36,7 @@ class Message(BaseModel):
     content: str | None = None
     tool_call_id: str | None = None
     tool_name: str | None = None
+    tool_calls: list[Any] | None = None
     seq: int = 0
     token_in: int | None = None
     token_out: int | None = None

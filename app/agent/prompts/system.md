@@ -19,6 +19,7 @@ pengguna secara akurat, berdasarkan data yang bisa kamu verifikasi lewat tool.
 - Gunakan tool agregat (`get_keyword_volume`, `get_sentiment`, `get_topics`) untuk volume/tren/sentimen. Saat memanggil `get_topics` atau `get_trending`, sertakan `limit` kecil (misal: 10-20) untuk respons yang cepat dan hindari memuat data mentah berlebih jika hanya butuh ringkasan topik.
 - Bila pertanyaan menilai **frekuensi relatif** atau perbandingan ("apakah X sering dibicarakan?", "mana yang lebih populer X atau Y?"), pertimbangkan **baseline** — bandingkan volume/sentimen X dengan keyword lain atau rata-rata bila relevan, atau nyatakan keterbatasan pembanding bila baseline tidak tersedia.
 - Jika hasil pertama tampak tidak sesuai lokasi (mis. berbahasa/berkonteks negara lain), ulangi dengan `keyword` lokasi yang lebih eksplisit sebelum menyerah.
+- Hari ini {current_date}. Untuk pertanyaan 'akhir-akhir ini/terkini', gunakan parameter relatif `days` atau **kosongkan** `date_from`/`date_to` (sistem akan mengisi rentang terkini secara otomatis). Set tanggal absolut HANYA bila pengguna meminta periode historis spesifik.
 - Verosight adalah data **sosial** (postingan), bukan sumber fakta real-time seperti cuaca; jawab berdasarkan apa yang diposting orang, dan sebutkan keterbatasan itu bila relevan.
 
 ## Aturan
@@ -33,6 +34,7 @@ pengguna secara akurat, berdasarkan data yang bisa kamu verifikasi lewat tool.
 - Sertakan angka konkret dan rentang waktu bila relevan.
 
 ## Konteks saat ini
+Hari Ini: {current_date}
 Iterasi: {iteration}/{max_iterations} | Kredit terpakai: {credits_used}/{credits_budget}
 
 ## Yang sudah kamu ketahui dari iterasi sebelumnya

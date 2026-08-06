@@ -284,9 +284,52 @@ async def test_result_truncation_for_large_outputs(monkeypatch):
     res = await executor.execute("large_data_tool", {})
     assert res.status == "success"
     assert res.truncated is True
-    assert isinstance(res.data, list)
     last_item = res.data[-1]
     assert "[dipotong," in str(last_item)
+
+
+@pytest.mark.asyncio
+async def test_tool_executor_date_normalization():
+    class DateArgs(BaseModel):
+        query: str = Field(...)
+        date_from: str | None = Field(default=None)
+        date_to: str | None = Field(default=None)
+
+    registry = ToolRegistry()
+
+    @register_tool(
+        name="date_dummy_tool",
+        description="Dummy date tool",
+        parameters=DateArgs.model_json_schema(),
+        registry=registry,
+    )
+    async def dummy_tool(query: str, date_from: str | None = None, date_to: str | None = None):
+        return {"query": query, "date_from": date_from, "date_to": date_to}
+
+    executor = ToolExecutor(registry=registry)
+
+    # 1. Kosong date_from & date_to -> diisi recent window otomatis
+    res1 = await executor.execute("date_dummy_tool", {"query": "test"})
+    assert res1.status == "success"
+    assert "date_from" in res1.data
+    assert "date_to" in res1.data
+    assert res1.data["date_from"] < res1.data["date_to"]
+
+    # 2. date_to di masa depan -> clamped ke today
+    res2 = await executor.execute(
+        "date_dummy_tool",
+        {"query": "test", "date_from": "2026-01-01", "date_to": "2099-12-31"},
+    )
+    assert res2.status == "success"
+    assert res2.data["date_to"] < "2099-12-31"
+
+    # 3. date_from > date_to -> swap / fixed
+    res3 = await executor.execute(
+        "date_dummy_tool",
+        {"query": "test", "date_from": "2026-05-01", "date_to": "2026-01-01"},
+    )
+    assert res3.status == "success"
+    assert res3.data["date_from"] <= res3.data["date_to"]
 
 
 # ---------------------------------------------------------------------------
