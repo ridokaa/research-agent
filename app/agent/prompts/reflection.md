@@ -2,7 +2,6 @@ Jawabanmu belum bisa dianggap final. Alasan: {reason}
 Informasi yang masih kurang: {missing}
 
 Tentukan satu langkah konkret berikutnya:
-- **Jika alasan di atas menyebut 'data sudah ada tapi belum dipakai'**: JANGAN panggil tool apa pun. Susun **ULANG** jawaban final memakai data yang SUDAH ada di memori (sebutkan angka sentimen & isi/pemicu post secara eksplisit). Ini bukan menggali baru, melainkan memakai yang sudah ada.
 - Pahami sinyal atau anomali dari hasil tool sebelumnya: jika ada lonjakan volume tak wajar, sentimen ekstrim, atau dominasi platform yang relevan dengan pertanyaan, pertimbangkan untuk mencari pemicunya (mis. via `search_posts` atau `semantic_search`).
 - Panggil tool lain yang belum pernah dicoba dan relevan.
 - Panggil tool yang sama dengan argumen berbeda (mis. perjelas lokasi atau rentang waktu).
