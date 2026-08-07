@@ -429,3 +429,35 @@ def test_normalize_platform_arguments():
     # Limit capping
     sql_limit = _validate_sql_query("SELECT * FROM runs LIMIT 500")
     assert "LIMIT 100" in sql_limit
+
+
+def test_strip_unknown_arguments():
+    executor = ToolExecutor()
+
+    class MockToolStrict:
+        spec = ToolSpec(
+            name="get_keyword_volume",
+            description="get volume",
+            parameters={"type": "object", "properties": {"keyword": {"type": "string"}, "days": {"type": "integer"}}},
+            source="verosight",
+        )
+
+    class MockToolFlexible:
+        spec = ToolSpec(
+            name="flexible_tool",
+            description="flexible",
+            parameters={"type": "object", "properties": {"a": {"type": "string"}}, "additionalProperties": True},
+            source="local",
+        )
+
+    tool_strict = MockToolStrict()
+    args1 = {"keyword": "IKN", "days": 30, "display_text": "Cek volume IKN 30 hari terakhir"}
+    res1 = executor._strip_unknown_arguments(tool_strict, args1)
+    assert res1 == {"keyword": "IKN", "days": 30}
+    assert "display_text" not in res1
+
+    tool_flexible = MockToolFlexible()
+    args2 = {"a": "test", "display_text": "extra"}
+    res2 = executor._strip_unknown_arguments(tool_flexible, args2)
+    assert res2 == {"a": "test", "display_text": "extra"}
+

@@ -219,6 +219,25 @@ class ToolExecutor:
 
         return args_dict
 
+    def _strip_unknown_arguments(self, tool: Any, args_dict: dict[str, Any]) -> dict[str, Any]:
+        """Strip unknown top-level parameters not declared in tool parameter schema properties.
+
+        - Preserves all properties defined in `tool.spec.parameters["properties"]`.
+        - If `additionalProperties` is explicitly True or `properties` is missing/not a dict, passes through.
+        - Logs stripped argument keys for observability.
+        """
+        schema = tool.spec.parameters if (tool and tool.spec) else None
+        if not isinstance(schema, dict):
+            return args_dict
+        props = schema.get("properties")
+        if not isinstance(props, dict) or schema.get("additionalProperties") is True:
+            return args_dict
+        allowed = set(props.keys())
+        stripped = [k for k in args_dict if k not in allowed]
+        if stripped:
+            log.info("tool.stripped_unknown_args", tool=tool.spec.name, stripped=stripped)
+        return {k: v for k, v in args_dict.items() if k in allowed}
+
     async def execute(
         self,
         name: str,
@@ -282,6 +301,9 @@ class ToolExecutor:
 
         # Platform normalization (strip platform if not mentioned in user_query)
         args_dict = self._normalize_platform_arguments(tool, args_dict, user_query=user_query)
+
+        # Strip unknown top-level arguments before schema validation
+        args_dict = self._strip_unknown_arguments(tool, args_dict)
 
         # Validate arguments against tool spec JSON Schema
         try:
