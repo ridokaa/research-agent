@@ -529,3 +529,41 @@ def test_sanitize_keyword_list_arguments():
     assert res4 == {"exclude_keywords": ["saham IKN"]}
 
 
+def test_dedupe_namespace_prefix():
+    executor = ToolExecutor()
+    assert executor._dedupe_namespace_prefix("verosight__verosight__search_posts") == "verosight__search_posts"
+    assert executor._dedupe_namespace_prefix("verosight__search_posts") == "verosight__search_posts"
+    assert executor._dedupe_namespace_prefix("verosight__get_keyword_volume") == "verosight__get_keyword_volume"
+    assert executor._dedupe_namespace_prefix("custom__custom__custom__tool") == "custom__tool"
+    assert executor._dedupe_namespace_prefix("calculator") == "calculator"
+    assert executor._dedupe_namespace_prefix("") == ""
+
+
+@pytest.mark.asyncio
+async def test_executor_repair_doubled_tool_name_prefix():
+    registry = ToolRegistry()
+
+    @register_tool(
+        name="verosight__search_posts",
+        description="Search posts tool",
+        cost_credits=1,
+        registry=registry,
+    )
+    async def mock_search(query: str = "") -> str:
+        return "search_ok"
+
+    executor = ToolExecutor(registry=registry)
+
+    # 1. Doubled prefix tool call -> repaired & executed successfully
+    res1 = await executor.execute("verosight__verosight__search_posts", {"query": "test"})
+    assert res1.status == "success"
+    assert res1.data == "search_ok"
+    assert res1.tool_name == "verosight__search_posts"
+
+    # 2. Non-existent tool call -> remains error
+    res2 = await executor.execute("verosight__verosight__non_existent_tool", {})
+    assert res2.status == "error"
+    assert "not found or disabled" in res2.error
+
+
+

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -29,6 +30,8 @@ _TRANSIENT_EXCEPTIONS = (
     OSError,
     ConnectionError,
 )
+
+_DUP_PREFIX_RE = re.compile(r"^([A-Za-z0-9]+__)\1+")
 
 
 def _is_empty_data(data: Any) -> bool:
@@ -293,6 +296,16 @@ class ToolExecutor:
 
         return new_args
 
+    def _dedupe_namespace_prefix(self, name: str) -> str:
+        """Collapse a repeated leading namespace token, e.g. 'verosight__verosight__x' -> 'verosight__x'.
+
+        Only the leading duplicated '<alias>__' run is collapsed; the tool base name (after the first
+        '__') is untouched. Returns name unchanged if no duplicated prefix is present.
+        """
+        if not name or "__" not in name:
+            return name
+        return _DUP_PREFIX_RE.sub(r"\1", name)
+
     async def execute(
         self,
         name: str,
@@ -309,6 +322,15 @@ class ToolExecutor:
         """
         start_time = time.perf_counter()
         tool = self._registry.get(name)
+
+        if tool is None:
+            repaired = self._dedupe_namespace_prefix(name)
+            if repaired != name:
+                candidate = self._registry.get(repaired)
+                if candidate is not None:
+                    log.info("tool.name_deduplicated", original=name, resolved=repaired)
+                    name = repaired
+                    tool = candidate
 
         if tool is None:
             res = ToolResult(
