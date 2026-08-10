@@ -100,12 +100,21 @@ class Planner:
         compacted = compact_input(history_items, keep_last_n=10)
         return instructions, compacted
 
-    def build_reflection_input(self, missing: str, reason: str = "Jawaban belum didukung data lengkap") -> dict[str, Any]:
+    def build_reflection_input(self, missing: str|None=None, reason: str|None=None) -> dict[str, Any]:
         """Build reflection message item using reflection.md template."""
-        content = self._reflection_template.format(
-            reason=reason or "Jawaban belum didukung data",
-            missing=missing or "Informasi pendukung belum cukup",
-        )
+
+        temp = self._reflection_template
+
+        if missing:
+            temp = "Informasi yang masih kurang: {y}. ".format(y=missing) + temp
+
+        if reason:
+            temp = "Jawabanmu belum bisa dianggap final. Alasan: {x}. ".format(x=reason) + temp
+
+
+
+        content = temp
+
         return {
             "type": "message",
             "role": "user",

@@ -1,6 +1,3 @@
-Jawabanmu belum bisa dianggap final. Alasan: {reason}
-Informasi yang masih kurang: {missing}
-
 Tentukan satu langkah konkret berikutnya:
 - Pahami sinyal atau anomali dari hasil tool sebelumnya: jika ada lonjakan volume tak wajar, sentimen ekstrim, atau dominasi platform yang relevan dengan pertanyaan, pertimbangkan untuk mencari pemicunya (mis. via `search_posts` atau `semantic_search`).
 - Panggil tool lain yang belum pernah dicoba dan relevan.
