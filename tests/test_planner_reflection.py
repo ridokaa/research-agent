@@ -29,3 +29,8 @@ def test_build_reflection_input_none_uses_template_only():
     assert "{reason}" not in content
     assert "{missing}" not in content
     assert content.lstrip().startswith("Tentukan satu langkah konkret berikutnya:")
+
+def test_system_prompt_no_location_filter_caveat_guidance():
+    planner = Planner()
+    assert "Verosight TIDAK punya filter geografis" in planner._system_template
+
