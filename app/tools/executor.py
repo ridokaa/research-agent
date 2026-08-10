@@ -238,6 +238,61 @@ class ToolExecutor:
             log.info("tool.stripped_unknown_args", tool=tool.spec.name, stripped=stripped)
         return {k: v for k, v in args_dict.items() if k in allowed}
 
+    def _sanitize_keyword_list_arguments(self, tool: Any, args_dict: dict[str, Any]) -> dict[str, Any]:
+        """Sanitize list-type keyword filter arguments for Verosight tools by dropping multi-word items.
+
+        - Scope: Only tools where tool.spec.source == "verosight".
+        - Target fields whitelist: {"exclude_keywords", "exclude_profiles"}.
+        - Checks property definition in tool schema parameters.
+        - For target list parameters: drops string elements containing whitespace (multi-word).
+        - Does NOT touch scalar keyword/query parameters.
+        - If all items in a list are dropped, removes the key from args_dict.
+        - Logs dropped items for observability.
+        """
+        if not args_dict or not (tool and getattr(tool, "spec", None)):
+            return args_dict
+
+        if getattr(tool.spec, "source", None) != "verosight":
+            return args_dict
+
+        schema = tool.spec.parameters if isinstance(getattr(tool.spec, "parameters", None), dict) else {}
+        props = schema.get("properties") if isinstance(schema, dict) else {}
+        if not isinstance(props, dict):
+            return args_dict
+
+        whitelist_keys = {"exclude_keywords", "exclude_profiles"}
+        target_keys = whitelist_keys.intersection(props.keys()).intersection(args_dict.keys())
+        if not target_keys:
+            return args_dict
+
+        new_args = dict(args_dict)
+        for key in target_keys:
+            val = new_args.get(key)
+            if not isinstance(val, list):
+                continue
+
+            kept = []
+            dropped = []
+            for elem in val:
+                if isinstance(elem, str):
+                    cleaned = elem.strip()
+                    if cleaned and len(cleaned.split()) == 1:
+                        kept.append(elem)
+                    else:
+                        dropped.append(elem)
+                else:
+                    dropped.append(elem)
+
+            if dropped:
+                log.info("tool.sanitized_keyword_list", tool=tool.spec.name, field=key, dropped=dropped)
+
+            if kept:
+                new_args[key] = kept
+            else:
+                new_args.pop(key, None)
+
+        return new_args
+
     async def execute(
         self,
         name: str,
@@ -301,6 +356,9 @@ class ToolExecutor:
 
         # Platform normalization (strip platform if not mentioned in user_query)
         args_dict = self._normalize_platform_arguments(tool, args_dict, user_query=user_query)
+
+        # Sanitize list-type keyword filters (drop multi-word elements; scalar keyword/query untouched)
+        args_dict = self._sanitize_keyword_list_arguments(tool, args_dict)
 
         # Strip unknown top-level arguments before schema validation
         args_dict = self._strip_unknown_arguments(tool, args_dict)

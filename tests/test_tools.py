@@ -461,3 +461,71 @@ def test_strip_unknown_arguments():
     res2 = executor._strip_unknown_arguments(tool_flexible, args2)
     assert res2 == {"a": "test", "display_text": "extra"}
 
+
+def test_sanitize_keyword_list_arguments():
+    executor = ToolExecutor()
+
+    class MockVerosightSearch:
+        spec = ToolSpec(
+            name="verosight__search_posts",
+            description="search posts",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string"},
+                    "exclude_keywords": {"type": "array", "items": {"type": "string"}},
+                    "exclude_profiles": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            source="verosight",
+        )
+
+    class MockNonVerosightSearch:
+        spec = ToolSpec(
+            name="local__search",
+            description="local search",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "exclude_keywords": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            source="local",
+        )
+
+    tool_vero = MockVerosightSearch()
+
+    # 1. Mixed single-word and multi-word in exclude_keywords -> drops multi-word
+    args1 = {
+        "keyword": "IKN",
+        "exclude_keywords": ["saham", "saham IKN", "NSIT", "ICN"],
+    }
+    res1 = executor._sanitize_keyword_list_arguments(tool_vero, args1)
+    assert res1["exclude_keywords"] == ["saham", "NSIT", "ICN"]
+    assert res1["keyword"] == "IKN"
+
+    # 2. All multi-word in exclude_keywords -> key removed
+    args2 = {
+        "keyword": "IKN",
+        "exclude_keywords": ["saham IKN", "pasar modal"],
+    }
+    res2 = executor._sanitize_keyword_list_arguments(tool_vero, args2)
+    assert "exclude_keywords" not in res2
+    assert res2["keyword"] == "IKN"
+
+    # 3. Scalar keyword is multi-word -> UNTOUCHED (must not be altered by list sanitizer)
+    args3 = {
+        "keyword": "Ibu Kota Nusantara",
+        "exclude_keywords": ["saham", "saham IKN"],
+    }
+    res3 = executor._sanitize_keyword_list_arguments(tool_vero, args3)
+    assert res3["keyword"] == "Ibu Kota Nusantara"
+    assert res3["exclude_keywords"] == ["saham"]
+
+    # 4. Non-Verosight tool -> untouched (no over-reach)
+    tool_non_vero = MockNonVerosightSearch()
+    args4 = {"exclude_keywords": ["saham IKN"]}
+    res4 = executor._sanitize_keyword_list_arguments(tool_non_vero, args4)
+    assert res4 == {"exclude_keywords": ["saham IKN"]}
+
+
