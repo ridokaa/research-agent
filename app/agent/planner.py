@@ -111,8 +111,6 @@ class Planner:
         if reason:
             temp = "Jawabanmu belum bisa dianggap final. Alasan: {x}. ".format(x=reason) + temp
 
-
-
         content = temp
 
         return {
