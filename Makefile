@@ -1,4 +1,4 @@
-.PHONY: up down dev migrate test lint format install
+.PHONY: up down dev run migrate test lint format install
 
 # ─── Docker ──────────────────────────────────────────────────────────────────
 up:
@@ -12,7 +12,10 @@ down:
 
 # ─── Dev server ──────────────────────────────────────────────────────────────
 dev:
-	uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+	uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app
+
+run:
+	uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # ─── Database migrations ─────────────────────────────────────────────────────
 migrate:

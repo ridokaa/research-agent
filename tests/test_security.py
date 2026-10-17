@@ -33,22 +33,50 @@ def _reset_rate_limit():
 # ---------------------------------------------------------------------------
 
 def test_secret_redaction_in_tracer():
-    """Verify secret patterns and sensitive keys are redacted by _redact."""
+    """Verify secret patterns and sensitive keys are redacted while non-secret keys are preserved."""
     payload = {
         "api_key": "sk-1234567890abcdef",
         "verosight_key": "vlt_live_9876543210",
         "authorization": "Bearer secret_token_xyz",
         "user_query": "My secret is sk-secretkey123",
+        "keyword": "keuangan",
+        "key": "get_volume:1:1",
+        "keywords": ["indonesia", "ojk"],
+        "token_in": 120,
+        "token_out": 45,
+        "tokens": 165,
         "nested": {
             "token": "vlt_nested_secret",
+            "keyword": "perbankan",
+            "key": "mem_123",
+            "access_token": "secret_access",
+            "refresh_token": "secret_refresh",
+            "password": "secret_password",
+            "secret_key": "secret_key_val",
         },
     }
     redacted = _redact(payload)
+    # Sensitive keys redacted
     assert redacted["api_key"] == "***"
     assert redacted["verosight_key"] == "***"
     assert redacted["authorization"] == "***"
+    assert redacted["nested"]["token"] == "***"
+    assert redacted["nested"]["access_token"] == "***"
+    assert redacted["nested"]["refresh_token"] == "***"
+    assert redacted["nested"]["password"] == "***"
+    assert redacted["nested"]["secret_key"] == "***"
     assert "sk-" not in str(redacted)
     assert "vlt_" not in str(redacted)
+
+    # Non-sensitive keys preserved
+    assert redacted["keyword"] == "keuangan"
+    assert redacted["key"] == "get_volume:1:1"
+    assert redacted["keywords"] == ["indonesia", "ojk"]
+    assert redacted["token_in"] == 120
+    assert redacted["token_out"] == 45
+    assert redacted["tokens"] == 165
+    assert redacted["nested"]["keyword"] == "perbankan"
+    assert redacted["nested"]["key"] == "mem_123"
 
 
 def test_structlog_secret_sanitizer():
@@ -133,17 +161,22 @@ async def test_rate_limit_per_ip():
     try:
         from app.config import get_settings
         settings = get_settings()
+        orig_limit = settings.RATE_LIMIT_PER_MINUTE
+        settings.RATE_LIMIT_PER_MINUTE = 5
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-            for i in range(settings.RATE_LIMIT_PER_MINUTE):
-                resp = await ac.post("/v1/agent/query", json={"query": "test query"})
-                assert resp.status_code != 429
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                for i in range(5):
+                    resp = await ac.post("/v1/agent/query", json={"query": "test query"})
+                    assert resp.status_code != 429
 
-            exceeded_resp = await ac.post("/v1/agent/query", json={"query": "test query"})
-            assert exceeded_resp.status_code == 429
-            data = exceeded_resp.json()
-            assert data["error"]["code"] == 429
-            assert "Rate limit exceeded" in data["error"]["message"]
+                exceeded_resp = await ac.post("/v1/agent/query", json={"query": "test query"})
+                assert exceeded_resp.status_code == 429
+                data = exceeded_resp.json()
+                assert data["error"]["code"] == 429
+                assert "Rate limit exceeded" in data["error"]["message"]
+        finally:
+            settings.RATE_LIMIT_PER_MINUTE = orig_limit
     finally:
         app.dependency_overrides.clear()
         await engine.dispose()

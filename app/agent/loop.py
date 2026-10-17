@@ -20,6 +20,7 @@ from app.agent.state import (
     AgentState,
     ConversationHistory,
     Message,
+    compact_tool_output_for_llm,
     persist_execution_memory_snapshot,
 )
 from app.config import get_settings
@@ -32,7 +33,7 @@ from app.logging.tracer import RunTracer
 from app.schemas.agent import RunOptions, RunResult
 from app.schemas.errors import ErrorReport
 from app.tools.executor import ToolExecutor
-from app.tools.registry import ToolRegistry, get_registry
+from app.tools.registry import ToolRegistry, get_registry, init_registry
 
 log = structlog.get_logger(__name__)
 
@@ -79,10 +80,14 @@ class AgentLoop:
             store=settings.LLM_STORE,
         )
 
+        effective_api_style = getattr(self.llm_client, "_api_style", settings.LLM_API_STYLE)
+        if effective_api_style == "chat_completions" and opts.store:
+            opts = opts.model_copy(update={"store": False})
+
         run_id = uuid.uuid4()
         conv_id = conversation_id or uuid.uuid4()
 
-        registry = self.registry if self.registry is not None else get_registry()
+        registry = self.registry if self.registry is not None else init_registry()
         executor = (
             self.executor
             if self.executor is not None
@@ -138,6 +143,9 @@ class AgentLoop:
                 store=opts.store,
                 tracer=tracer,
                 reasoning_effort=settings.LLM_REASONING_EFFORT,
+                api_style=settings.LLM_API_STYLE,
+                temperature=settings.LLM_TEMPERATURE,
+                max_output_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
             )
 
         state = AgentState(
@@ -158,6 +166,7 @@ class AgentLoop:
         pending_inputs: list[dict[str, Any]] = []
         no_progress_count: int = 0
         final_answer: str | None = None
+        synthesis_mode: bool = False
 
         try:
             while True:
@@ -191,6 +200,16 @@ class AgentLoop:
                 instructions, llm_input = self.planner.build_request(
                     state, pending_inputs=pending_inputs, store=opts.store
                 )
+
+                # Synthesis mode: right-size context BEFORE the call so the model
+                # produces text (never the oversized-context empty) and flows into self-check.
+                if synthesis_mode and state.execution_memory:
+                    mem_block = state.execution_memory.get_context_block(
+                        max_tokens=4000, current_iteration=state.iteration, rich=True
+                    )
+                    if mem_block:
+                        llm_input = self.planner.build_synthesis_input(state.user_query, mem_block)
+
                 tracer.event(
                     "context_built",
                     f"Built request context for iteration {state.iteration}",
@@ -198,22 +217,40 @@ class AgentLoop:
                         "iteration": state.iteration,
                         "has_previous_id": state.last_response_id is not None,
                         "memory_items_count": len(state.execution_memory),
+                        "synthesis_mode": synthesis_mode,
                     },
                 )
 
                 # --- 2. LLM respond ---
                 try:
-                    tools_def = registry.to_responses_tools()
-                    if opts.tools_allow is not None:
-                        tools_def = [t for t in tools_def if t.get("name") in opts.tools_allow]
-                    if opts.tools_deny is not None:
-                        tools_def = [t for t in tools_def if t.get("name") not in opts.tools_deny]
+                    api_style = getattr(llm, "_api_style", settings.LLM_API_STYLE)
+                    tools_def = registry.to_tools(
+                        api_style=api_style,
+                        tools_allow=opts.tools_allow,
+                        tools_deny=opts.tools_deny,
+                    )
+                    effective_tools = None if synthesis_mode else (tools_def if tools_def else None)
+                    prev_id = None if synthesis_mode else (state.last_response_id if opts.store else None)
                     response = await llm.respond(
                         input=llm_input,
                         instructions=instructions,
-                        tools=tools_def if tools_def else None,
-                        previous_response_id=state.last_response_id if opts.store else None,
+                        tools=effective_tools,
+                        previous_response_id=prev_id,
                     )
+                    MAX_EMPTY_RETRY = 2
+                    attempts = 0
+                    while (not response.function_calls and not response.output_text) and attempts < MAX_EMPTY_RETRY:
+                        attempts += 1
+                        tracer.event(
+                            "thinking",
+                            f"LLM returned empty response (flake provider); retrying attempt {attempts}/{MAX_EMPTY_RETRY}",
+                        )
+                        response = await llm.respond(
+                            input=llm_input,
+                            instructions=instructions,
+                            tools=effective_tools,
+                            previous_response_id=prev_id,
+                        )
                 except LLMError as err:
                     state.status = "failed"
                     tracer.event(
@@ -278,6 +315,15 @@ class AgentLoop:
                         payload={"tools": tool_calls_payload},
                     )
 
+                    # Store assistant tool call requests in pending_inputs to preserve chat sequence
+                    for fc in response.function_calls:
+                        pending_inputs.append({
+                            "type": "function_call",
+                            "call_id": fc.call_id,
+                            "name": fc.name,
+                            "arguments": fc.arguments_dict,
+                        })
+
                     new_info_obtained = False
                     uncached_calls: list[tuple[Any, tuple[str, dict[str, Any]]]] = []
 
@@ -311,6 +357,7 @@ class AgentLoop:
                             tracer=tracer,
                             run_id=run_id,
                             db_session=self.session,
+                            user_query=state.user_query,
                         )
 
                         for (fc, args_tuple), res in zip(uncached_calls, results):
@@ -356,17 +403,26 @@ class AgentLoop:
                         )
 
                     await tracer.flush()
+                    synthesis_mode = True
                     continue
 
                 # --- 4. Handle Final Text Output & Self-Check ---
                 if response.output_text and not response.function_calls:
                     draft_answer = response.output_text
 
-                    # Execute self-check using finalize.md
+                    # Execute self-check using finalize.md (rich context + tool availability)
                     mem_block = state.execution_memory.get_context_block(
-                        max_tokens=2000, current_iteration=state.iteration
+                        max_tokens=4000, current_iteration=state.iteration, rich=True
                     )
-                    finalize_input = self.planner.build_finalize_input(draft_answer, mem_block)
+                    executed_tools = list({item.origin_tool for item in state.execution_memory.items})
+                    all_tools = [s.name for s in registry.list_specs()] if registry else []
+                    available_tools = [t for t in all_tools if t not in executed_tools]
+                    finalize_input = self.planner.build_finalize_input(
+                        draft_answer,
+                        mem_block,
+                        executed_tools=executed_tools,
+                        available_tools=available_tools,
+                    )
 
                     is_final = True
                     reason = ""
@@ -383,6 +439,16 @@ class AgentLoop:
                             is_final = bool(eval_data.get("is_final", True))
                             reason = str(eval_data.get("reason", ""))
                             missing = str(eval_data.get("missing", "") or "")
+
+                            # Anti-loop guard: don't force re-gather for an already-tried tool
+                            # or when iterations are nearly exhausted.
+                            if not is_final:
+                                if missing and missing in executed_tools:
+                                    log.info("agent_loop.self_check_override_already_executed", tool=missing)
+                                    is_final = True
+                                elif state.iteration >= state.max_iterations - 1:
+                                    log.info("agent_loop.self_check_override_max_iterations", iteration=state.iteration)
+                                    is_final = True
                     except Exception as err:
                         log.warning("agent_loop.self_check_failed", error=str(err))
                         is_final = True
@@ -408,6 +474,7 @@ class AgentLoop:
                     )
                     pending_inputs.append(reflection_msg)
                     no_progress_count += 1
+                    synthesis_mode = False
 
                     if self.session is not None:
                         if conv_history is not None:
@@ -422,6 +489,10 @@ class AgentLoop:
                     continue
 
                 # If model returned neither function calls nor output text, break to finalizer
+                tracer.event(
+                    "thinking",
+                    "LLM returned empty response (no tool calls, no output text); breaking to finalizer",
+                )
                 break
 
             # --- Exhausted / Timeout / Fallback Finalization ---
@@ -429,31 +500,63 @@ class AgentLoop:
                 mem_block = state.execution_memory.get_context_block(
                     max_tokens=2000, current_iteration=state.iteration
                 )
-                fallback_prompt = self.planner.build_fallback_prompt(user_query, mem_block)
-                try:
-                    fallback_resp = await llm.respond(
-                        input=fallback_prompt,
-                        instructions="Kamu adalah agen riset. Jawab sejujurnya berdasarkan data yang ada dan sebutkan keterbatasannya. JANGAN mengarang data.",
-                    )
-                    final_answer = (
-                        fallback_resp.output_text
-                        or "Tidak dapat memperoleh jawaban lengkap dari data tool yang tersedia."
-                    )
-                except Exception as exc:
-                    if mem_block:
-                        final_answer = f"Berdasarkan data yang terkumpul: {mem_block[:300]} (keterbatasan: iterasi/budget habis)."
-                    else:
-                        final_answer = f"Informasi tidak cukup untuk menjawab secara lengkap ({exc})."
+                if state.execution_memory:
+                    fallback_prompt = self.planner.build_fallback_prompt(user_query, mem_block)
+                    try:
+                        fallback_resp = await llm.respond(
+                            input=fallback_prompt,
+                            instructions="Kamu adalah agen riset. Jawab sejujurnya berdasarkan data yang ada dan sebutkan keterbatasannya. JANGAN mengarang data.",
+                        )
+                        final_answer = (
+                            fallback_resp.output_text
+                            or "Tidak dapat memperoleh jawaban lengkap dari data tool yang tersedia."
+                        )
+                    except Exception as exc:
+                        if mem_block:
+                            final_answer = f"Berdasarkan data yang terkumpul: {mem_block[:300]} (keterbatasan: iterasi/budget habis)."
+                        else:
+                            final_answer = f"Informasi tidak cukup untuk menjawab secara lengkap ({exc})."
 
-                tracer.event(
-                    "final_answer",
-                    f"Fallback answer generated (status={state.status})",
-                    payload={"answer": final_answer, "status": state.status},
-                )
+                    if state.status == "running":
+                        state.status = "success" if final_answer else "exhausted"
+
+                    tracer.event(
+                        "final_answer",
+                        f"Fallback answer generated (status={state.status})",
+                        payload={"answer": final_answer, "status": state.status},
+                    )
+                else:
+                    state.status = "failed"
+                    final_answer = "Run failed: Provider mengembalikan respons kosong berulang tanpa data."
+                    tracer.event(
+                        "error",
+                        "LLM returned empty response repeatedly with no execution memory",
+                        payload=ErrorReport(
+                            component="llm",
+                            stage="empty_response",
+                            message="Provider mengembalikan respons kosong berulang",
+                        ).model_dump(),
+                    )
+                    tracer.event(
+                        "final_answer",
+                        f"Empty fallback (status={state.status})",
+                        payload={"answer": final_answer, "status": state.status},
+                    )
+
+        except Exception as exc:
+            state.status = "failed"
+            log.exception("agent_loop.unhandled_error", error=str(exc))
+            rep = ErrorReport(component="api", stage="execution", message=str(exc))
+            tracer.event("error", f"Uncaught run error: {exc}", payload=rep.model_dump())
+            final_answer = f"Run failed due to internal error: {exc}"
 
         finally:
             if self.llm_client is None:
                 await llm.aclose()
+
+        # Ensure state.status is never 'running'
+        if state.status not in ("success", "failed", "exhausted", "timeout"):
+            state.status = "exhausted" if final_answer else "failed"
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -475,21 +578,27 @@ class AgentLoop:
         )
 
         if self.session is not None and run_repo is not None:
-            await run_repo.update_status(
-                run_id,
-                status=state.status,
-                final_answer=final_answer or "",
-                iterations=state.iteration,
-                credits_used=state.credits_used,
-                latency_ms=latency_ms,
-                last_response_id=state.last_response_id,
-            )
-            if conv_history is not None:
-                await conv_history.persist_iteration(
-                    state.messages, run_id=run_id, last_response_id=state.last_response_id
+            try:
+                await run_repo.update_status(
+                    run_id,
+                    status=state.status,
+                    final_answer=final_answer or "",
+                    iterations=state.iteration,
+                    credits_used=state.credits_used,
+                    latency_ms=latency_ms,
+                    last_response_id=state.last_response_id,
                 )
+                if conv_history is not None:
+                    await conv_history.persist_iteration(
+                        state.messages, run_id=run_id, last_response_id=state.last_response_id
+                    )
+            except Exception as db_exc:
+                log.warning("agent_loop.db_persistence_failed", error=str(db_exc))
 
-        await tracer.flush()
+        try:
+            await tracer.flush()
+        except Exception as tracer_exc:
+            log.warning("agent_loop.tracer_flush_failed", error=str(tracer_exc))
 
         self.last_state = state
         self.last_tracer = tracer
@@ -503,14 +612,26 @@ class AgentLoop:
         except Exception:
             pass
 
-        return RunResult(
-            run_id=run_id,
-            conversation_id=conv_id,
-            answer=final_answer or "",
-            status=state.status,  # type: ignore[arg-type]
-            iterations=state.iteration,
-            latency_ms=latency_ms,
-        )
+        try:
+            return RunResult(
+                run_id=run_id,
+                conversation_id=conv_id,
+                answer=final_answer or "",
+                status=state.status,  # type: ignore[arg-type]
+                iterations=state.iteration,
+                latency_ms=latency_ms,
+            )
+        except Exception as exc:
+            log.exception("agent_loop.run_result_construction_failed", error=str(exc))
+            safe_status = state.status if state.status in ("success", "failed", "exhausted", "timeout") else "failed"
+            return RunResult(
+                run_id=run_id,
+                conversation_id=conv_id,
+                answer=final_answer or f"Run completed with status error: {exc}",
+                status=safe_status,
+                iterations=state.iteration,
+                latency_ms=latency_ms,
+            )
 
 
 async def run_agent(

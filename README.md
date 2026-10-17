@@ -1,12 +1,36 @@
-# Agentic Loop
+# 🔎 research-agent
 
-> Agentic Loop adalah sistem agen riset otonom yang bekerja dalam iterasi (reason-act loop), mengeksekusi berbagai perkakas (*tools*), dan berhenti secara independen ketika telah memperoleh serta memverifikasi jawaban final.
+**Agen riset otonom berbasis LLM.** Ajukan pertanyaan dalam bahasa natural → agen merencanakan, memanggil *tools* secara berulang (reason–act loop), memeriksa jawabannya sendiri, lalu **berhenti otomatis** saat jawaban final sudah terverifikasi. Pengguna hanya menerima jawaban bersih; seluruh langkah berpikir & pemanggilan tool tersimpan sebagai *trace* di PostgreSQL.
+
+Saat ini sumber datanya adalah **Verosight** (analitik media sosial: sentimen, trending, topik, postingan & komentar) yang terhubung lewat **MCP** atau **REST**. Inti agennya generik: tool lain cukup ditambahkan tanpa mengubah loop.
+
+```text
+"Berapa sentimen publik soal program Makan Bergizi Gratis minggu ini?"
+        │
+        ▼  agen memanggil verosight_sentiment → verosight_trending → … → self-check
+        ▼
+{"answer": "...ringkasan jawaban final...", "run_id": "...", "status": "success", "iterations": 3}
+```
+
+> 🔀 Project terkait: [**trending-topic-mapper**](https://github.com/ridokaa/trending-topic-mapper) (notebook klasifikasi topik) · [**bbm-sentiment-api**](https://github.com/ridokaa/bbm-sentiment-api) (API sentimen BBM).
+
+---
+
+## ✨ Fitur Utama
+
+| Fitur | Keterangan |
+|---|---|
+| **Agentic loop** | Planner → LLM → eksekusi tool → refleksi & *self-check* → ulangi / berhenti |
+| **Dua gaya API LLM** | `LLM_API_STYLE=responses` (OpenAI Responses API) atau `chat_completions` (9Router, DeepSeek, provider OpenAI-compatible) |
+| **Tool auto-discovery** | Tool lokal via dekorator `@register_tool`; tool Verosight di-*ingest* otomatis dari server MCP (`VEROSIGHT_MODE=mcp \| rest \| both`) |
+| **Guardrail** | Batas iterasi, waktu, dan kredit per run; deduplikasi & cache panggilan tool; rate limit per IP |
+| **Jawaban bersih** | `POST /v1/agent/query` hanya mengembalikan jawaban + metadata; *trace* lengkap via `GET /v1/runs/{id}/trace` |
+| **Observabilitas** | Trace per langkah di PostgreSQL, log JSONL, metrik Prometheus, CLI simulasi & replay |
+| **Transparansi error** | Tanpa data *mock*: kegagalan tool/LLM dilaporkan apa adanya (`ErrorReport`), bukan dikarang |
 
 ---
 
 ## 1. Arsitektur Sistem
-
-Berikut adalah alur eksekusi komponen dari request pengguna hingga pengembalian jawaban final (sesuai bagian 1.1 PROMPT_PLAN.md):
 
 ```text
 Pengguna (Query)
@@ -20,77 +44,113 @@ Pengguna (Query)
     ├────────────────────── AGENTIC LOOP ──────────────────────┐
     │                                                          │
     │  1. Planner.build_request()                              │
-    │     Membangun system prompt + riwayat + memory item      │
+    │     System prompt + riwayat percakapan + memory item     │
     │                                                          │
-    │  2. LLMClient.respond() (Responses API)                  │
-    │     Mengirim payload ke OpenAI / LLM Provider            │
+    │  2. LLMClient.respond()                                  │
+    │     Responses API atau Chat Completions (LLM_API_STYLE)  │
     │                                                          │
     │  3. Handle Response                                      │
-    │     ├─ function_calls ──► ToolExecutor.execute_tools()  │
-    │     │                     ├─ Dedup & Cache check         │
-    │     │                     ├─ Parallel execution          │
-    │     │                     └─ Truncate & Save memory      │
-    │     │
-    │     └─ text response  ──► Reflection & Finalize Self-Check
-    │                           ├─ is_final = True  ──► STOP   │
-    │                           └─ is_final = False ──► REPEAT │
+    │     ├─ tool calls ──► ToolExecutor.execute_tools()       │
+    │     │                 ├─ Dedup & cache check             │
+    │     │                 ├─ Eksekusi paralel                │
+    │     │                 │   (tool lokal / Verosight MCP)   │
+    │     │                 └─ Simpan hasil ke memory          │
+    │     │                                                    │
+    │     └─ teks jawaban ──► Reflection & finalize self-check │
+    │                         ├─ is_final = True  ──► STOP     │
+    │                         └─ is_final = False ──► ULANGI   │
     │                                                          │
-    │  4. Evaluasi Policy (Max Iterations / Credits / Timeout) │
+    │  4. Evaluasi Policy (max iterasi / kredit / timeout)     │
     └──────────────────────────────────────────────────────────┘
     │
     ▼
-[RunResult] ──► HANYA mengembalikan answer + metadata run
-                 (Detail trace & thinking dapat diakses via GET /v1/runs/{id}/trace)
+[RunResult] ──► HANYA answer + metadata run
+                (trace & proses berpikir via GET /v1/runs/{id}/trace)
 ```
+
+### Tools bawaan
+
+| Sumber | Tool |
+|---|---|
+| Lokal | `calculator`, `current_time`, `db_query` |
+| Verosight | `verosight_sentiment`, `verosight_sentiment_trend`, `verosight_trending`, `verosight_topics`, `verosight_search_posts`, `verosight_list_posts`, `verosight_list_comments` |
+
+Pada `VEROSIGHT_MODE=mcp`, daftar tool Verosight diambil langsung dari `list_tools()` server MCP sehingga bisa bertambah mengikuti Verosight.
 
 ---
 
 ## 2. Cara Setup & Menjalankan Project
 
 ### 2.1. Persyaratan Sistem
-- Docker & Docker Compose
+- Docker & Docker Compose (untuk PostgreSQL)
 - Python 3.11+
-- virtualenv (atau `.venv`)
+- API key LLM (OpenAI atau provider OpenAI-compatible) dan API key Verosight
 
 ### 2.2. Setup Lingkungan & Secrets
-Copy `.env.example` ke `.env` dan isi API key milik Anda:
 ```bash
+git clone https://github.com/ridokaa/research-agent.git
+cd research-agent
 cp .env.example .env
-# Edit .env: atur LLM_API_KEY dan VEROSIGHT_API_KEY
+# Edit .env: isi LLM_API_KEY dan VEROSIGHT_API_KEY
 ```
 
-### 2.3. Menjalankan Docker Service
-Jalankan container PostgreSQL (`rag_db`):
+Konfigurasi penting di `.env`:
+
+| Variabel | Default | Keterangan |
+|---|---|---|
+| `LLM_API_STYLE` | `responses` | `responses` (OpenAI) atau `chat_completions` (9Router / DeepSeek / OpenAI-compatible) |
+| `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | OpenAI, `gpt-4o-mini` | Endpoint & model LLM |
+| `AGENT_MAX_ITERATIONS` | `8` | Batas putaran loop per run |
+| `AGENT_RUN_TIMEOUT_S` | `180` | Batas waktu per run (detik) |
+| `AGENT_CREDITS_BUDGET` | `100` | Batas kredit tool per run |
+| `TOOL_RESULT_PASSTHROUGH` | `true` | `true` = hasil tool dikirim utuh ke LLM; `false` = dipotong/diringkas dulu |
+| `VEROSIGHT_MODE` | `mcp` | `mcp` (tool dari server MCP), `rest` (wrapper REST lokal), atau `both` |
+| `VEROSIGHT_ENABLED` | `true` | Matikan untuk menjalankan agen tanpa Verosight |
+
+### 2.3. Menjalankan PostgreSQL
 ```bash
-docker compose up -d
-# Atau menggunakan Makefile:
-make up
+docker compose up -d      # atau: make up
 ```
 
 ### 2.4. Instalasi Dependency & Migrasi Database
-Aktifkan virtualenv dan jalankan migrasi database Alembic:
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt  # atau make install
-
-# Jalankan migrasi schema ke PostgreSQL
-alembic upgrade head
-# Atau menggunakan Makefile:
-make migrate
+make install              # pip install -e ".[dev]" (pakai uv jika tersedia)
+make migrate              # alembic upgrade head
 ```
 
 ### 2.5. Menjalankan Server FastAPI
-Jalankan server pengembangan FastAPI dengan hot-reload:
 ```bash
-uvicorn app.main:app --reload --port 8000
-# Atau menggunakan Makefile:
-make dev
+make dev                  # uvicorn app.main:app --reload --port 8000
 ```
-Akses Swagger UI dokumentasi OpenAPI di: `http://localhost:8000/docs`
+Swagger UI: `http://localhost:8000/docs`
+
+### 2.6. Endpoint API
+
+| Method | Endpoint | Fungsi |
+|---|---|---|
+| `POST` | `/v1/agent/query` | Jalankan agen, kembalikan jawaban final + metadata |
+| `POST` | `/v1/agent/query/stream` | Sama, jawaban di-*stream* via SSE |
+| `GET` | `/v1/runs`, `/v1/runs/{run_id}` | Daftar & detail run |
+| `GET` | `/v1/runs/{run_id}/trace` | Trace lengkap langkah demi langkah |
+| `GET` | `/v1/runs/{run_id}/tools` | Daftar pemanggilan tool dalam run |
+| `GET` | `/v1/conversations`, `/v1/conversations/{id}` | Riwayat percakapan |
+| `GET` | `/v1/tools` | Tool yang terdaftar & aktif |
+| `GET` | `/health`, `/health/deps` | Status server; status DB, LLM, dan MCP |
+| `GET` | `/metrics` | Metrik Prometheus |
+
+```bash
+curl -X POST http://localhost:8000/v1/agent/query \
+     -H "Content-Type: application/json" \
+     -d '{"query": "Apa topik yang sedang trending soal banjir 7 hari terakhir?"}'
+```
+
+Kirim ulang `conversation_id` dari respons sebelumnya untuk melanjutkan percakapan.
 
 ---
 
-## 3. Menjalankan Simulasi (CLI & Viewer)
+## 3. Menjalankan Simulasi (CLI)
 
 Sistem menyediakan Typer CLI di `scripts/simulate.py` untuk menguji agen secara live tanpa browser/frontend.
 
@@ -116,10 +176,10 @@ Render ulang trace eksekusi run masa lalu dari database:
 python scripts/simulate.py replay <run_id>
 ```
 
-### 3.4. Debug Timeline Viewer (HTML)
-Buka peramban untuk melihat timeline visual interaktif (hanya aktif jika `APP_ENV=local`):
-```text
-http://localhost:8000/debug/runs/<run_id>
+### 3.4. Melihat Trace via API
+Trace lengkap (langkah berpikir, panggilan tool, hasil) dari run mana pun:
+```bash
+curl http://localhost:8000/v1/runs/<run_id>/trace | jq .
 ```
 
 ---
@@ -195,3 +255,16 @@ Keputusan arsitektur mendasar dicatat dalam direktori `docs/adr/`:
 - [`0001-only-final-answer-in-query-response.md`](docs/adr/0001-only-final-answer-in-query-response.md): Alasan pengembalian jawaban bersih tanpa proses berpikir pada endpoint `/v1/agent/query`.
 - [`0002-tool-call-deduplication.md`](docs/adr/0002-tool-call-deduplication.md): Strategi deduplikasi & caching hasil tool untuk mencegah loop tak berujung.
 - [`0003-mcp-and-rest-separation.md`](docs/adr/0003-mcp-and-rest-separation.md): Pemisahan integrasi dinamis MCP dan wrapper REST lokal.
+
+---
+
+## 7. Postman Collection & Environment
+
+Postman Collection (v2.1) dan Environment telah disediakan di direktori [`docs/postman/`](docs/postman/):
+
+1. **Import File ke Postman:**
+   - [Postman Collection](docs/postman/Agentic_Loop_API.postman_collection.json) (`Agentic_Loop_API.postman_collection.json`)
+   - [Postman Environment](docs/postman/Agentic_Loop_Local.postman_environment.json) (`Agentic_Loop_Local.postman_environment.json`)
+2. **Pilih Environment:** Aktifkan environment **`Agentic Loop — Local`** (`baseUrl: http://localhost:8000`).
+3. **Fitur Otomatisasi:** Request `POST /v1/agent/query` secara otomatis mengekstrak `run_id` dan `conversation_id` dari response JSON dan menyimpannya ke Environment untuk digunakan di endpoint `Runs` dan `Conversations`.
+

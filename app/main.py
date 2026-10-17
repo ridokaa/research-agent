@@ -45,10 +45,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # 2. Init tool registry (auto-discovery)
     try:
-        from app.tools.registry import get_registry
+        from app.tools.registry import init_registry
 
-        registry = get_registry()
-        registry.discover()
+        registry = init_registry()
         logger.info("startup.tool_registry_ready", tools=len(registry))
     except Exception as exc:  # noqa: BLE001
         logger.warning("startup.tool_registry_failed", error=str(exc))
@@ -61,7 +60,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             mcp_manager = get_mcp_manager()
             await mcp_manager.connect_all()
             logger.info("startup.mcp_connected")
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
         logger.warning("startup.mcp_connect_failed", error=str(exc))
 
     logger.info("startup.complete")

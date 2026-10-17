@@ -66,7 +66,7 @@ class MCPManager:
             return [
                 {
                     "alias": "verosight",
-                    "transport": "sse",
+                    "transport": settings.VEROSIGHT_MCP_TRANSPORT,
                     "url": settings.VEROSIGHT_MCP_SSE_URL,
                     "headers": {"X-API-Key": settings.VEROSIGHT_API_KEY},
                     "enabled": True,
@@ -81,6 +81,7 @@ class MCPManager:
 
     async def connect_all(self) -> None:
         """Connect to all configured enabled MCP servers and register tools into ToolRegistry."""
+        settings = get_settings()
         configs = self.get_server_configs()
         registry = get_registry()
         now = time.monotonic()
@@ -101,6 +102,7 @@ class MCPManager:
             # Check existing client or build new one
             client = self._clients.get(alias)
             if client is None:
+                timeout_s = float(config.get("timeout_s", settings.MCP_TIMEOUT_S))
                 client = MCPClient(
                     alias=alias,
                     transport=transport,
@@ -109,6 +111,7 @@ class MCPManager:
                     args=args,
                     headers=headers,
                     env=env,
+                    timeout_s=timeout_s,
                 )
                 self._clients[alias] = client
 
@@ -143,7 +146,7 @@ class MCPManager:
                 self._tool_cache[alias] = (specs, now)
                 logger.info("mcp.server_connected", alias=alias, tools=len(specs))
 
-            except Exception as exc:  # noqa: BLE001
+            except BaseException as exc:  # noqa: BLE001
                 logger.warning(
                     "mcp.server_connect_failed",
                     alias=alias,

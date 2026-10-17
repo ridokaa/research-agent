@@ -31,8 +31,11 @@ def _reset_reg():
 # Pure Logic Tests (No Network / No HTTP Mocks)
 # ===========================================================================
 
-def test_summarize_verosight_response_truncates_sample_and_removes_empty_media_urls():
-    """Verify that summarize_verosight_response truncates sample_* to <= 5 items and strips empty media_urls."""
+def test_summarize_verosight_response_truncates_sample_and_removes_empty_media_urls(monkeypatch):
+    """Verify that summarize_verosight_response truncates sample_* to <= 5 items and strips empty media_urls when passthrough is False."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "TOOL_RESULT_PASSTHROUGH", False)
+
     raw_envelope = {
         "data": {
             "total_posts": 100,
@@ -125,6 +128,75 @@ async def test_executor_validation_stage_for_verosight_tools(monkeypatch):
     report_dict = json.loads(res.error)
     assert report_dict["component"] == "verosight"
     assert report_dict["stage"] == "validation"
+
+
+import httpx
+import respx
+from app.tools.verosight.search import verosight_search_posts, verosight_list_posts, verosight_list_comments
+from app.tools.verosight.analytics import verosight_sentiment, verosight_sentiment_trend, verosight_trending, verosight_topics
+
+
+@pytest.mark.asyncio
+async def test_verosight_client_error_responses(respx_mock):
+    """Test 401, 429, 500, and network error handling in VerosightClient."""
+    respx_mock.post("https://api.verosight.com/v1/auth/token").mock(return_value=httpx.Response(200, json={"data": {"token": "jwt_mock_token"}}))
+
+    client = VerosightClient(api_key="vlt_test_key", base_url="https://api.verosight.com")
+
+    respx_mock.get("https://api.verosight.com/v1/posts").mock(return_value=httpx.Response(401))
+    res = await client.request("GET", "/v1/posts")
+    assert res.error.stage == "auth_token"
+
+    respx_mock.get("https://api.verosight.com/v1/posts").mock(return_value=httpx.Response(429))
+    res = await client.request("GET", "/v1/posts")
+    assert res.error.stage == "rate_limited"
+
+    respx_mock.get("https://api.verosight.com/v1/posts").mock(return_value=httpx.Response(500))
+    res = await client.request("GET", "/v1/posts")
+    assert res.error.stage == "server_error"
+
+    respx_mock.get("https://api.verosight.com/v1/posts").mock(return_value=httpx.Response(400))
+    res = await client.request("GET", "/v1/posts")
+    assert res.error.stage == "http_request"
+
+
+@pytest.mark.asyncio
+async def test_verosight_search_and_analytics_tools(respx_mock, monkeypatch):
+    """Test search and analytics tools with mocked success envelopes."""
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "VEROSIGHT_API_KEY", "vlt_test_key")
+
+    respx_mock.post("https://api.verosight.com/v1/auth/token").mock(return_value=httpx.Response(200, json={"data": {"token": "jwt_mock_token"}}))
+
+    env = {
+        "data": {"sample_posts": [{"id": 1, "text": "Post 1"}], "pos": 10, "neg": 2},
+        "meta": {"credits_used": 5},
+    }
+    respx_mock.post("https://api.verosight.com/v1/search").mock(return_value=httpx.Response(200, json=env))
+    respx_mock.get("https://api.verosight.com/v1/posts").mock(return_value=httpx.Response(200, json=env))
+    respx_mock.get("https://api.verosight.com/v1/comments").mock(return_value=httpx.Response(200, json=env))
+    respx_mock.get("https://api.verosight.com/v1/analytics/sentiment").mock(return_value=httpx.Response(200, json=env))
+    respx_mock.get("https://api.verosight.com/v1/analytics/sentiment-trend").mock(return_value=httpx.Response(200, json=env))
+    respx_mock.get("https://api.verosight.com/v1/analytics/trending").mock(return_value=httpx.Response(200, json=env))
+    respx_mock.get("https://api.verosight.com/v1/analytics/topics").mock(return_value=httpx.Response(200, json=env))
+
+    r1 = await verosight_search_posts(query="AI")
+    assert r1.status in ("success", "empty")
+
+    r2 = await verosight_list_posts(limit=5)
+    assert r2.status in ("success", "empty")
+
+    r3 = await verosight_list_comments(limit=5)
+    assert r3.status in ("success", "empty")
+
+    r4 = await verosight_sentiment(query="AI")
+    assert r4.status in ("success", "empty")
+
+    r5 = await verosight_trending()
+    assert r5.status in ("success", "empty")
+
+    r6 = await verosight_topics()
+    assert r6.status in ("success", "empty")
 
 
 # ===========================================================================

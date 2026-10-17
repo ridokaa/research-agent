@@ -44,13 +44,14 @@ class Settings(BaseSettings):
         return v
 
     # ---------------------------------------------------------------------------
-    # LLM (OpenAI Responses API — POST {LLM_BASE_URL}/responses)
+    # LLM (Responses API vs Chat Completions API — POST {LLM_BASE_URL}/...)
     # ---------------------------------------------------------------------------
+    LLM_API_STYLE: Literal["responses", "chat_completions"] = "responses"
     LLM_BASE_URL: str = "https://api.openai.com/v1"
     LLM_API_KEY: str = "sk-xxx"
     LLM_MODEL: str = "gpt-4o-mini"
-    LLM_TEMPERATURE: float = Field(default=0.2, ge=0.0, le=2.0)
-    LLM_MAX_OUTPUT_TOKENS: int = Field(default=2048, ge=1)
+    LLM_TEMPERATURE: float = Field(default=0.7, ge=0.0, le=2.0)
+    LLM_MAX_OUTPUT_TOKENS: int = Field(default=16000, ge=1)
     LLM_TIMEOUT_S: float = Field(default=60.0, gt=0)
     LLM_STORE: bool = True
     LLM_REASONING_EFFORT: str | None = None
@@ -70,7 +71,12 @@ class Settings(BaseSettings):
     AGENT_RUN_TIMEOUT_S: float = Field(default=180.0, gt=0)
     AGENT_CREDITS_BUDGET: int = Field(default=100, ge=0)
     AGENT_PARALLEL_TOOLS: bool = True
-    TOOLS_DISABLED: list[str] = Field(default_factory=list)
+    TOOL_RESULT_PASSTHROUGH: bool = True
+    AGENT_TIMEZONE: str = "Asia/Jakarta"
+    AGENT_DEFAULT_WINDOW_DAYS: int = Field(default=30, ge=1)
+    TOOLS_DISABLED: list[str] = Field(
+        default_factory=lambda: ["verosight__get_share_of_voice"]
+    )
 
     @field_validator("TOOLS_DISABLED", mode="before")
     @classmethod
@@ -90,9 +96,11 @@ class Settings(BaseSettings):
     VEROSIGHT_API_BASE: str = "https://api.verosight.com"
     VEROSIGHT_API_KEY: str = "vlt_live_xxx"
     VEROSIGHT_MCP_SSE_URL: str = "https://api.verosight.com/v1/mcp/sse"
+    VEROSIGHT_MCP_TRANSPORT: Literal["sse", "streamable_http", "stdio"] = "sse"
     VEROSIGHT_ENABLED: bool = True
     VEROSIGHT_MODE: Literal["rest", "mcp", "both"] = "mcp"
     MCP_SERVERS_JSON: str = ""
+    MCP_TIMEOUT_S: float = Field(default=60.0, gt=0)
 
     @model_validator(mode="after")
     def validate_no_placeholder_secrets(self) -> Settings:

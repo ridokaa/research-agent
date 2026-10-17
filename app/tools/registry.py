@@ -122,13 +122,22 @@ class ToolRegistry:
             return None
         return tool
 
-    def list_specs(self, tags: list[str] | None = None) -> list[ToolSpec]:
-        """List specs for all enabled tools, optionally filtered by tags."""
+    def list_specs(
+        self,
+        tags: list[str] | None = None,
+        tools_allow: list[str] | None = None,
+        tools_deny: list[str] | None = None,
+    ) -> list[ToolSpec]:
+        """List specs for all enabled tools, optionally filtered by tags, tools_allow, and tools_deny."""
         settings = get_settings()
         specs: list[ToolSpec] = []
         for _name, tool in self._tools.items():
             spec = tool.spec
             if not self._is_tool_active(spec):
+                continue
+            if tools_allow is not None and spec.name not in tools_allow:
+                continue
+            if tools_deny is not None and spec.name in tools_deny:
                 continue
             if tags:
                 spec_tags = set(spec.tags)
@@ -145,7 +154,12 @@ class ToolRegistry:
             specs.append(spec)
         return specs
 
-    def to_responses_tools(self, tags: list[str] | None = None) -> list[dict[str, Any]]:
+    def to_responses_tools(
+        self,
+        tags: list[str] | None = None,
+        tools_allow: list[str] | None = None,
+        tools_deny: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return tools formatted for the OpenAI Responses API.
 
         Format: flat structure without nested 'function' wrapper:
@@ -158,8 +172,43 @@ class ToolRegistry:
                 "description": spec.description,
                 "parameters": spec.parameters,
             }
-            for spec in self.list_specs(tags=tags)
+            for spec in self.list_specs(tags=tags, tools_allow=tools_allow, tools_deny=tools_deny)
         ]
+
+    def to_chat_tools(
+        self,
+        tags: list[str] | None = None,
+        tools_allow: list[str] | None = None,
+        tools_deny: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return tools formatted for the OpenAI Chat Completions API.
+
+        Format: nested structure with 'function' wrapper:
+        {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.parameters,
+                },
+            }
+            for spec in self.list_specs(tags=tags, tools_allow=tools_allow, tools_deny=tools_deny)
+        ]
+
+    def to_tools(
+        self,
+        api_style: str = "responses",
+        tags: list[str] | None = None,
+        tools_allow: list[str] | None = None,
+        tools_deny: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return tools formatted for given api_style ('responses' | 'chat_completions')."""
+        if api_style == "chat_completions":
+            return self.to_chat_tools(tags=tags, tools_allow=tools_allow, tools_deny=tools_deny)
+        return self.to_responses_tools(tags=tags, tools_allow=tools_allow, tools_deny=tools_deny)
 
     def discover(self, package_path: str = "app.tools") -> None:
         """Auto-discover and import all modules under package_path."""
@@ -200,6 +249,14 @@ def get_registry() -> ToolRegistry:
     if _registry is None:
         _registry = ToolRegistry()
     return _registry
+
+
+def init_registry() -> ToolRegistry:
+    """Ensure the global ToolRegistry is initialized and auto-discovered."""
+    registry = get_registry()
+    if len(registry) == 0:
+        registry.discover()
+    return registry
 
 
 def reset_registry() -> ToolRegistry:

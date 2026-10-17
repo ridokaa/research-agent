@@ -36,12 +36,25 @@ class Planner:
         if not mem_block:
             mem_block = "(Belum ada data dari tool)"
 
+        from datetime import datetime, UTC
+        import zoneinfo
+        from app.config import get_settings
+
+        settings = get_settings()
+        try:
+            tz = zoneinfo.ZoneInfo(settings.AGENT_TIMEZONE)
+        except Exception:
+            tz = UTC
+
+        current_date_str = datetime.now(tz=tz).strftime("%A, %d %B %Y")
+
         return self._system_template.format(
             iteration=state.iteration,
             max_iterations=state.max_iterations,
             credits_used=state.credits_used,
             credits_budget=state.credits_budget,
             execution_memory=mem_block,
+            current_date=current_date_str,
         )
 
     def build_request(
@@ -87,22 +100,39 @@ class Planner:
         compacted = compact_input(history_items, keep_last_n=10)
         return instructions, compacted
 
-    def build_reflection_input(self, missing: str, reason: str = "Jawaban belum didukung data lengkap") -> dict[str, Any]:
+    def build_reflection_input(self, missing: str|None=None, reason: str|None=None) -> dict[str, Any]:
         """Build reflection message item using reflection.md template."""
-        content = self._reflection_template.format(
-            reason=reason or "Jawaban belum didukung data",
-            missing=missing or "Informasi pendukung belum cukup",
-        )
+
+        temp = self._reflection_template
+
+        if missing:
+            temp = "Informasi yang masih kurang: {y}. ".format(y=missing) + temp
+
+        if reason:
+            temp = "Jawabanmu belum bisa dianggap final. Alasan: {x}. ".format(x=reason) + temp
+
+        content = temp
+
         return {
             "type": "message",
             "role": "user",
             "content": content,
         }
 
-    def build_finalize_input(self, draft_answer: str, execution_memory_text: str = "") -> str:
+    def build_finalize_input(
+        self,
+        draft_answer: str,
+        execution_memory_text: str = "",
+        executed_tools: list[str] | None = None,
+        available_tools: list[str] | None = None,
+    ) -> str:
         """Build prompt for self-check finalization evaluation."""
+        executed_str = ", ".join(executed_tools) if executed_tools else "(Belum ada tool)"
+        available_str = ", ".join(available_tools) if available_tools else "(Semua tool)"
         return (
             f"{self._finalize_template}\n\n"
+            f"--- Tool yang SUDAH Dipanggil ---\n{executed_str}\n\n"
+            f"--- Tool TERSEDIA yang BELUM Dipanggil ---\n{available_str}\n\n"
             f"--- Draf Jawaban ---\n{draft_answer}\n\n"
             f"--- Data Tool Terkait ---\n{execution_memory_text or '(Tidak ada data tool)'}"
         )
@@ -111,8 +141,25 @@ class Planner:
         """Build prompt for forced finalization on exhausted/timeout status."""
         return (
             f"Pertanyaan pengguna: {user_query}\n\n"
-            f"Data yang sudah diperoleh dari tool sejauh ini:\n"
+            f"Berikut data tool yang SUDAH TERKUMPUL di memori eksekusi:\n"
             f"{execution_memory_text or '(Belum ada data tool yang berhasil diperoleh)'}\n\n"
-            f"Instruksi: Jawab sejujurnya dengan data yang ada, sebutkan keterbatasannya. "
-            f"JANGAN mengarang data baru."
+            f"Instruksi WAJIB:\n"
+            f"1. Rangkum dan sajikan SELURUH data nyata yang ada di atas untuk menjawab pertanyaan pengguna.\n"
+            f"2. Sebutkan angka, statistik, dan fakta spesifik yang ada di memori.\n"
+            f"3. DILARANG MENYATAKAN bahwa 'tidak ada data' atau 'belum ada data' bila memori di atas memuat data!\n"
+            f"4. Sebutkan keterbatasan bila ada aspek yang belum terjawab, namun JANGAN MENGABAIKAN data yang sudah berhasil terkumpul."
         )
+
+    def build_synthesis_input(self, user_query: str, execution_memory_text: str = "") -> str:
+        """Build prompt for proactive right-sized synthesis when synthesis_mode=True."""
+        return (
+            f"Pertanyaan pengguna: {user_query}\n\n"
+            f"Berikut data ringkas yang SUDAH TERKUMPUL dari tool:\n"
+            f"{execution_memory_text or '(Belum ada data tool yang diperoleh)'}\n\n"
+            f"Instruksi Sintesis:\n"
+            f"1. Analisis dan jawab pertanyaan pengguna secara komprehensif menggunakan data di atas.\n"
+            f"2. Sertakan angka, statistik, topik, dan sentimen secara akurat dari data yang tersedia.\n"
+            f"3. DILARANG MENYATAKAN bahwa 'tidak ada data' atau 'belum ada data' bila memori di atas memuat data!\n"
+            f"4. Jangan mengabaikan data yang sudah ada, dan sebutkan keterbatasan hanya jika data memang tidak mencakup aspek tersebut."
+        )
+

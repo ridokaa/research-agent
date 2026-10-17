@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
+import zoneinfo
 
 import httpx
 import jsonschema
@@ -27,6 +30,8 @@ _TRANSIENT_EXCEPTIONS = (
     OSError,
     ConnectionError,
 )
+
+_DUP_PREFIX_RE = re.compile(r"^([A-Za-z0-9]+__)\1+")
 
 
 def _is_empty_data(data: Any) -> bool:
@@ -108,6 +113,199 @@ class ToolExecutor:
         self._registry = registry if registry is not None else get_registry()
         self._db_session = db_session
 
+    @property
+    def registry(self) -> ToolRegistry:
+        return self._registry
+
+    def _normalize_date_arguments(self, tool: Any, args_dict: dict[str, Any]) -> dict[str, Any]:
+        """Normalize date_from and date_to parameters deterministically based on tool schema.
+
+        - Uses system date from AGENT_TIMEZONE (default Asia/Jakarta).
+        - If date_from and date_to are missing/empty, populates default recent window (AGENT_DEFAULT_WINDOW_DAYS).
+        - Clamps future date_to to today.
+        - Ensures date_from <= date_to.
+        """
+        params_props = tool.spec.parameters.get("properties", {}) if tool.spec and tool.spec.parameters else {}
+        has_date_from = "date_from" in params_props
+        has_date_to = "date_to" in params_props
+
+        if not (has_date_from or has_date_to):
+            return args_dict
+
+        new_args = dict(args_dict)
+
+        settings = get_settings()
+        try:
+            tz = zoneinfo.ZoneInfo(settings.AGENT_TIMEZONE)
+        except Exception:
+            tz = UTC
+
+        today = datetime.now(tz=tz).date()
+        default_days = settings.AGENT_DEFAULT_WINDOW_DAYS
+
+        val_from_str = new_args.get("date_from")
+        val_to_str = new_args.get("date_to")
+
+        val_from = None
+        if val_from_str and isinstance(val_from_str, str):
+            try:
+                val_from = datetime.strptime(val_from_str.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        val_to = None
+        if val_to_str and isinstance(val_to_str, str):
+            try:
+                val_to = datetime.strptime(val_to_str.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        # Aturan 1: Jika keduanya kosong -> default recent window
+        if val_from is None and val_to is None:
+            val_to = today
+            val_from = today - timedelta(days=default_days)
+        elif val_from is not None and val_to is None:
+            val_to = today
+        elif val_from is None and val_to is not None:
+            val_from = val_to - timedelta(days=default_days)
+
+        # Aturan 2: Bila date_to di masa depan -> clamp ke today
+        if val_to > today:
+            val_to = today
+
+        # Aturan 3: Bila date_from > date_to -> perbaiki
+        if val_from > val_to:
+            val_from = max(val_to - timedelta(days=default_days), datetime.min.date())
+
+        if has_date_from or "date_from" in new_args or val_from_str is not None:
+            new_args["date_from"] = val_from.strftime("%Y-%m-%d")
+        if has_date_to or "date_to" in new_args or val_to_str is not None:
+            new_args["date_to"] = val_to.strftime("%Y-%m-%d")
+
+        return new_args
+
+    def _normalize_platform_arguments(
+        self, tool: Any, args_dict: dict[str, Any], user_query: str | None = None
+    ) -> dict[str, Any]:
+        """Strip 'platform' parameter if model over-constrained it and user query did NOT mention a platform.
+
+        Intent detection:
+        - Checks user_query (lowercase) for explicit platform mentions ('tiktok', 'twitter', 'instagram',
+          'facebook', 'youtube', 'threads', etc. or explicit 'x' patterns like 'di x', 'platform x', 'twitter/x').
+        - If 'platform' is present in args_dict but user_query is provided and does not mention any platform,
+          remove 'platform' from args_dict.
+        """
+        if not args_dict or "platform" not in args_dict:
+            return args_dict
+
+        params_props = tool.spec.parameters.get("properties", {}) if tool.spec and tool.spec.parameters else {}
+        if "platform" not in params_props:
+            return args_dict
+
+        if user_query is None or not user_query.strip():
+            return args_dict
+
+        q = user_query.lower()
+        explicit_platforms = ["tiktok", "twitter", "instagram", "facebook", "youtube", "threads", "linkedin", "reddit"]
+        has_platform_mention = any(p in q for p in explicit_platforms)
+
+        if not has_platform_mention:
+            # Check for explicit 'x' patterns
+            import re
+            if re.search(r"\b(di\s+x|platform\s+x|twitter/x|x/twitter)\b", q):
+                has_platform_mention = True
+
+        if not has_platform_mention:
+            new_args = dict(args_dict)
+            new_args.pop("platform", None)
+            return new_args
+
+        return args_dict
+
+    def _strip_unknown_arguments(self, tool: Any, args_dict: dict[str, Any]) -> dict[str, Any]:
+        """Strip unknown top-level parameters not declared in tool parameter schema properties.
+
+        - Preserves all properties defined in `tool.spec.parameters["properties"]`.
+        - If `additionalProperties` is explicitly True or `properties` is missing/not a dict, passes through.
+        - Logs stripped argument keys for observability.
+        """
+        schema = tool.spec.parameters if (tool and tool.spec) else None
+        if not isinstance(schema, dict):
+            return args_dict
+        props = schema.get("properties")
+        if not isinstance(props, dict) or schema.get("additionalProperties") is True:
+            return args_dict
+        allowed = set(props.keys())
+        stripped = [k for k in args_dict if k not in allowed]
+        if stripped:
+            log.info("tool.stripped_unknown_args", tool=tool.spec.name, stripped=stripped)
+        return {k: v for k, v in args_dict.items() if k in allowed}
+
+    def _sanitize_keyword_list_arguments(self, tool: Any, args_dict: dict[str, Any]) -> dict[str, Any]:
+        """Sanitize list-type keyword filter arguments for Verosight tools by dropping multi-word items.
+
+        - Scope: Only tools where tool.spec.source == "verosight".
+        - Target fields whitelist: {"exclude_keywords", "exclude_profiles"}.
+        - Checks property definition in tool schema parameters.
+        - For target list parameters: drops string elements containing whitespace (multi-word).
+        - Does NOT touch scalar keyword/query parameters.
+        - If all items in a list are dropped, removes the key from args_dict.
+        - Logs dropped items for observability.
+        """
+        if not args_dict or not (tool and getattr(tool, "spec", None)):
+            return args_dict
+
+        if getattr(tool.spec, "source", None) != "verosight":
+            return args_dict
+
+        schema = tool.spec.parameters if isinstance(getattr(tool.spec, "parameters", None), dict) else {}
+        props = schema.get("properties") if isinstance(schema, dict) else {}
+        if not isinstance(props, dict):
+            return args_dict
+
+        whitelist_keys = {"exclude_keywords", "exclude_profiles"}
+        target_keys = whitelist_keys.intersection(props.keys()).intersection(args_dict.keys())
+        if not target_keys:
+            return args_dict
+
+        new_args = dict(args_dict)
+        for key in target_keys:
+            val = new_args.get(key)
+            if not isinstance(val, list):
+                continue
+
+            kept = []
+            dropped = []
+            for elem in val:
+                if isinstance(elem, str):
+                    cleaned = elem.strip()
+                    if cleaned and len(cleaned.split()) == 1:
+                        kept.append(elem)
+                    else:
+                        dropped.append(elem)
+                else:
+                    dropped.append(elem)
+
+            if dropped:
+                log.info("tool.sanitized_keyword_list", tool=tool.spec.name, field=key, dropped=dropped)
+
+            if kept:
+                new_args[key] = kept
+            else:
+                new_args.pop(key, None)
+
+        return new_args
+
+    def _dedupe_namespace_prefix(self, name: str) -> str:
+        """Collapse a repeated leading namespace token, e.g. 'verosight__verosight__x' -> 'verosight__x'.
+
+        Only the leading duplicated '<alias>__' run is collapsed; the tool base name (after the first
+        '__') is untouched. Returns name unchanged if no duplicated prefix is present.
+        """
+        if not name or "__" not in name:
+            return name
+        return _DUP_PREFIX_RE.sub(r"\1", name)
+
     async def execute(
         self,
         name: str,
@@ -116,6 +314,7 @@ class ToolExecutor:
         run_id: UUID | None = None,
         step_seq: int | None = None,
         db_session: AsyncSession | None = None,
+        user_query: str | None = None,
     ) -> ToolResult:
         """Execute a tool by name with argument validation, timeout, and retries.
 
@@ -123,6 +322,15 @@ class ToolExecutor:
         """
         start_time = time.perf_counter()
         tool = self._registry.get(name)
+
+        if tool is None:
+            repaired = self._dedupe_namespace_prefix(name)
+            if repaired != name:
+                candidate = self._registry.get(repaired)
+                if candidate is not None:
+                    log.info("tool.name_deduplicated", original=name, resolved=repaired)
+                    name = repaired
+                    tool = candidate
 
         if tool is None:
             res = ToolResult(
@@ -164,6 +372,18 @@ class ToolExecutor:
                 return res
         else:
             args_dict = arguments or {}
+
+        # System-level date normalization (schema-driven date_from / date_to handling)
+        args_dict = self._normalize_date_arguments(tool, args_dict)
+
+        # Platform normalization (strip platform if not mentioned in user_query)
+        args_dict = self._normalize_platform_arguments(tool, args_dict, user_query=user_query)
+
+        # Sanitize list-type keyword filters (drop multi-word elements; scalar keyword/query untouched)
+        args_dict = self._sanitize_keyword_list_arguments(tool, args_dict)
+
+        # Strip unknown top-level arguments before schema validation
+        args_dict = self._strip_unknown_arguments(tool, args_dict)
 
         # Validate arguments against tool spec JSON Schema
         try:
@@ -208,17 +428,49 @@ class ToolExecutor:
         while attempt < max_attempts:
             attempt += 1
             try:
-                raw_output = await asyncio.wait_for(
-                    tool.run(**args_dict),
-                    timeout=tool.spec.timeout_s,
-                )
-                break
+                task = asyncio.ensure_future(tool.run(**args_dict))
+                done, _pending = await asyncio.wait({task}, timeout=tool.spec.timeout_s)
+                if task in done:
+                    raw_output = task.result()
+                    break
+                else:
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                    elapsed = int((time.perf_counter() - start_time) * 1000)
+                    tool_result_obj = ToolResult(
+                        tool_name=name,
+                        status="timeout",
+                        error=f"Tool '{name}' timed out after {tool.spec.timeout_s}s",
+                        duration_ms=elapsed,
+                    )
+                    break
             except TimeoutError:
                 elapsed = int((time.perf_counter() - start_time) * 1000)
                 tool_result_obj = ToolResult(
                     tool_name=name,
                     status="timeout",
                     error=f"Tool '{name}' timed out after {tool.spec.timeout_s}s",
+                    duration_ms=elapsed,
+                )
+                break
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    try:
+                        current.uncancel()
+                    except Exception:
+                        pass
+                elapsed = int((time.perf_counter() - start_time) * 1000)
+                tool_result_obj = ToolResult(
+                    tool_name=name,
+                    status="timeout",
+                    error=(
+                        f"Tool '{name}' timed out after {tool.spec.timeout_s}s "
+                        "(call cancelled at the MCP/anyio boundary)."
+                    ),
                     duration_ms=elapsed,
                 )
                 break
@@ -270,8 +522,10 @@ class ToolExecutor:
         except Exception:
             pass
 
-        # Truncate large payloads before LLM context entry
-        res = _truncate_result(res)
+        # Truncate large payloads before LLM context entry unless passthrough is enabled
+        settings = get_settings()
+        if not settings.TOOL_RESULT_PASSTHROUGH:
+            res = _truncate_result(res)
 
         # Log & record invocation
         await self._record_execution(
@@ -293,10 +547,11 @@ class ToolExecutor:
         run_id: UUID | None = None,
         step_seq: int | None = None,
         db_session: AsyncSession | None = None,
+        user_query: str | None = None,
     ) -> list[ToolResult]:
         """Execute multiple tool calls sequentially or in parallel."""
         settings = get_settings()
-        if settings.AGENT_PARALLEL_TOOLS:
+        if settings.AGENT_PARALLEL_TOOLS and len(calls) > 1:
             tasks = [
                 self.execute(
                     name=name,
@@ -304,11 +559,45 @@ class ToolExecutor:
                     tracer=tracer,
                     run_id=run_id,
                     step_seq=step_seq,
-                    db_session=db_session,
+                    db_session=None,
+                    user_query=user_query,
                 )
                 for name, args in calls
             ]
-            return list(await asyncio.gather(*tasks))
+            raw_results = list(await asyncio.gather(*tasks, return_exceptions=True))
+            results: list[ToolResult] = []
+            for (name, _), res in zip(calls, raw_results):
+                if isinstance(res, ToolResult):
+                    results.append(res)
+                else:
+                    err_msg = str(res) if res is not None else "Unknown error in parallel tool execution"
+                    results.append(
+                        ToolResult(
+                            tool_name=name,
+                            status="error",
+                            error=f"Tool '{name}' execution failed: {err_msg}",
+                            duration_ms=0,
+                        )
+                    )
+            if db_session is not None:
+                for (name, args), res in zip(calls, results):
+                    args_dict = (
+                        args
+                        if isinstance(args, dict)
+                        else (json.loads(args) if isinstance(args, str) and args.strip().startswith("{") else {})
+                    )
+                    tool = self._registry.get(name)
+                    source = tool.spec.source if tool else "local"
+                    await self._record_execution(
+                        res=res,
+                        arguments=args_dict,
+                        tracer=None,
+                        run_id=run_id,
+                        step_seq=step_seq,
+                        session=db_session,
+                        source=source,
+                    )
+            return results
 
         results: list[ToolResult] = []
         for name, args in calls:
@@ -319,6 +608,7 @@ class ToolExecutor:
                 run_id=run_id,
                 step_seq=step_seq,
                 db_session=db_session,
+                user_query=user_query,
             )
             results.append(res)
         return results
@@ -352,16 +642,20 @@ class ToolExecutor:
         effective_run_id = run_id or (tracer.run_id if tracer is not None else None)
         if session is not None and effective_run_id is not None:
             try:
+                from app.agent.state import _to_jsonable
+
                 repo = ToolInvocationRepo(session)
+                raw = res.raw_data if res.raw_data is not None else res.model_dump()
+                result_json = _to_jsonable(raw)
                 result_payload = (
-                    res.raw_data if res.raw_data is not None else res.model_dump()
+                    result_json if isinstance(result_json, dict) else {"result": result_json}
                 )
                 await repo.record_invocation(
                     run_id=effective_run_id,
                     tool_name=res.tool_name,
                     source=source,
                     step_seq=step_seq,
-                    arguments=arguments,
+                    arguments=_to_jsonable(arguments),
                     result=result_payload,
                     status=res.status,
                     error=res.error,

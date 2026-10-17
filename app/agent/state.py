@@ -36,10 +36,99 @@ class Message(BaseModel):
     content: str | None = None
     tool_call_id: str | None = None
     tool_name: str | None = None
+    tool_calls: list[Any] | None = None
     seq: int = 0
     token_in: int | None = None
     token_out: int | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(tz=UTC))
+
+
+NOISE_KEYS = {
+    "top_posts",
+    "top_profiles",
+    "sample_posts",
+    "raw_content",
+    "posts_sample",
+    "media_urls",
+    "media",
+    "author_details",
+    "raw_json",
+}
+
+
+def prune_noise_from_data(obj: Any) -> Any:
+    """Recursively prune heavy non-essential noise fields for LLM context rendering while preserving all factual data."""
+    if isinstance(obj, dict):
+        new_dict = {}
+        for k, v in obj.items():
+            if k in NOISE_KEYS:
+                continue
+            new_dict[k] = prune_noise_from_data(v)
+        return new_dict
+    elif isinstance(obj, list):
+        return [prune_noise_from_data(x) for x in obj]
+    return obj
+
+
+def compact_tool_output_for_llm(val: Any, max_bytes: int = 4000) -> Any:
+    """Compact raw tool output for LLM context by pruning noise fields."""
+    return prune_noise_from_data(val)
+
+
+def _format_value_for_context(val: Any, max_chars: int = 1500, rich: bool = False) -> str:
+    """Format memory value cleanly for prompt context without breaking JSON structures mid-object."""
+    if val is None:
+        return ""
+
+    if rich:
+        max_chars = max(max_chars, 4000)
+
+    val = prune_noise_from_data(val)
+
+    if not isinstance(val, (dict, list)):
+        s = str(val)
+        return s if len(s) <= max_chars else s[:max_chars] + "..."
+
+    try:
+        json_str = json.dumps(val, ensure_ascii=False)
+        if len(json_str) <= max_chars:
+            return json_str
+    except Exception:
+        pass
+
+    if isinstance(val, dict):
+        pruned_dict: dict[str, Any] = {}
+        for k, v in val.items():
+            if isinstance(v, list):
+                kept: list[Any] = []
+                for item in v:
+                    kept.append(item)
+                    if len(json.dumps({k: kept}, ensure_ascii=False, default=str)) > max_chars - 200:
+                        break
+                if len(kept) < len(v):
+                    pruned_dict[k] = kept + [f"[+ {len(v) - len(kept)} items omitted for context size]"]
+                else:
+                    pruned_dict[k] = kept
+            else:
+                pruned_dict[k] = v
+        try:
+            return json.dumps(pruned_dict, ensure_ascii=False, default=str)
+        except Exception:
+            return str(pruned_dict)[:max_chars] + "..."
+    elif isinstance(val, list):
+        kept_list: list[Any] = []
+        for item in val:
+            kept_list.append(item)
+            if len(json.dumps(kept_list, ensure_ascii=False, default=str)) > max_chars - 100:
+                break
+        if len(kept_list) < len(val):
+            kept_list.append(f"[+ {len(val) - len(kept_list)} items omitted for context size]")
+        try:
+            return json.dumps(kept_list, ensure_ascii=False, default=str)
+        except Exception:
+            return str(kept_list)[:max_chars] + "..."
+
+    return str(val)[:max_chars] + "..."
 
 
 class MemoryItem(BaseModel):
@@ -120,8 +209,15 @@ class ExecutionMemory(BaseModel):
             elif tool_result.status == "empty":
                 summary = "Empty result returned"
             else:
-                raw_str = str(tool_result.data) if tool_result.data is not None else "Success"
-                summary = raw_str[:200]
+                if isinstance(tool_result.data, dict):
+                    clean_data = prune_noise_from_data(tool_result.data)
+                    keys = list(clean_data.keys())[:8] if isinstance(clean_data, dict) else list(tool_result.data.keys())[:8]
+                    summary = f"Result dict with keys: {keys}"
+                elif isinstance(tool_result.data, list):
+                    summary = f"Result list with {len(tool_result.data)} items"
+                else:
+                    raw_str = str(tool_result.data) if tool_result.data is not None else "Success"
+                    summary = raw_str[:200]
 
         if key is None:
             key = f"{tool_result.tool_name}:{iteration}:{len(self.items) + 1}"
@@ -147,7 +243,9 @@ class ExecutionMemory(BaseModel):
         self.items.append(item)
         return item
 
-    def get_context_block(self, max_tokens: int = 2000, current_iteration: int = 0) -> str:
+    def get_context_block(
+        self, max_tokens: int = 2000, current_iteration: int = 0, rich: bool = False
+    ) -> str:
         """Render memory into a concise text block for prompt injection.
 
         Priority & Filtering Rules:
@@ -156,6 +254,9 @@ class ExecutionMemory(BaseModel):
           (i.e. current_iteration - item.iteration >= 2).
         - Respect max_tokens limit.
         """
+        if rich:
+            max_tokens = max(max_tokens, 4000)
+
         valid_items: list[MemoryItem] = []
         for item in self.items:
             if item.status in ("error", "empty") and (current_iteration - item.iteration >= 2):
@@ -192,8 +293,14 @@ class ExecutionMemory(BaseModel):
 
         lines = [header]
         for item in selected:
+            val_detail = ""
+            if item.value is not None and item.status == "success":
+                val_str = _format_value_for_context(
+                    item.value, max_chars=budget * 3 if rich else 1500, rich=rich
+                )
+                val_detail = f" | Data: {val_str}"
             lines.append(
-                f"- [Iter {item.iteration} | {item.origin_tool}] {item.key}: {item.summary}"
+                f"- [Iter {item.iteration} | {item.origin_tool}] {item.key}: {item.summary}{val_detail}"
             )
 
         return "\n".join(lines)
@@ -315,6 +422,23 @@ class ConversationHistory:
         await self.session.flush()
 
 
+def _to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, BaseModel):
+        return _to_jsonable(obj.model_dump(mode="json"))
+    if hasattr(obj, "model_dump"):
+        try:
+            return _to_jsonable(obj.model_dump(mode="json"))
+        except Exception:
+            pass
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(x) for x in obj]
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    return str(obj)
+
+
 async def persist_execution_memory_snapshot(
     session: AsyncSession,
     run_id: UUID,
@@ -324,7 +448,8 @@ async def persist_execution_memory_snapshot(
     """Write snapshot lines to execution_memory table for given iteration."""
     for item in execution_memory.items:
         if item.iteration == iteration:
-            val = item.value if isinstance(item.value, dict) else {"value": item.value}
+            jsonable_val = _to_jsonable(item.value)
+            val = jsonable_val if isinstance(jsonable_val, dict) else {"value": jsonable_val}
             mem_orm = ExecutionMemoryORM(
                 id=uuid.uuid4(),
                 run_id=run_id,

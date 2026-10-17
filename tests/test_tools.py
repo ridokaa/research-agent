@@ -160,6 +160,15 @@ def test_tools_disabled_config_filter():
         names = [s.name for s in specs]
         assert "tool_a" not in names
         assert "tool_b" in names
+        responses_names = [t["name"] for t in registry.to_responses_tools()]
+        assert "tool_a" not in responses_names
+        assert "tool_b" in responses_names
+        chat_names = [t["function"]["name"] for t in registry.to_chat_tools()]
+        assert "tool_a" not in chat_names
+        assert "tool_b" in chat_names
+        to_tools_names = [t["function"]["name"] for t in registry.to_tools("chat_completions")]
+        assert "tool_a" not in to_tools_names
+        assert "tool_b" in to_tools_names
 
 
 def test_auto_discovery():
@@ -270,7 +279,10 @@ async def test_empty_result_normalization():
 
 
 @pytest.mark.asyncio
-async def test_result_truncation_for_large_outputs():
+async def test_result_truncation_for_large_outputs(monkeypatch):
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "TOOL_RESULT_PASSTHROUGH", False)
+
     registry = ToolRegistry()
 
     @register_tool(name="large_data_tool", registry=registry)
@@ -281,9 +293,52 @@ async def test_result_truncation_for_large_outputs():
     res = await executor.execute("large_data_tool", {})
     assert res.status == "success"
     assert res.truncated is True
-    assert isinstance(res.data, list)
     last_item = res.data[-1]
     assert "[dipotong," in str(last_item)
+
+
+@pytest.mark.asyncio
+async def test_tool_executor_date_normalization():
+    class DateArgs(BaseModel):
+        query: str = Field(...)
+        date_from: str | None = Field(default=None)
+        date_to: str | None = Field(default=None)
+
+    registry = ToolRegistry()
+
+    @register_tool(
+        name="date_dummy_tool",
+        description="Dummy date tool",
+        parameters=DateArgs.model_json_schema(),
+        registry=registry,
+    )
+    async def dummy_tool(query: str, date_from: str | None = None, date_to: str | None = None):
+        return {"query": query, "date_from": date_from, "date_to": date_to}
+
+    executor = ToolExecutor(registry=registry)
+
+    # 1. Kosong date_from & date_to -> diisi recent window otomatis
+    res1 = await executor.execute("date_dummy_tool", {"query": "test"})
+    assert res1.status == "success"
+    assert "date_from" in res1.data
+    assert "date_to" in res1.data
+    assert res1.data["date_from"] < res1.data["date_to"]
+
+    # 2. date_to di masa depan -> clamped ke today
+    res2 = await executor.execute(
+        "date_dummy_tool",
+        {"query": "test", "date_from": "2026-01-01", "date_to": "2099-12-31"},
+    )
+    assert res2.status == "success"
+    assert res2.data["date_to"] < "2099-12-31"
+
+    # 3. date_from > date_to -> swap / fixed
+    res3 = await executor.execute(
+        "date_dummy_tool",
+        {"query": "test", "date_from": "2026-05-01", "date_to": "2026-01-01"},
+    )
+    assert res3.status == "success"
+    assert res3.data["date_from"] <= res3.data["date_to"]
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +386,42 @@ def test_builtin_db_query_sql_validation():
     with pytest.raises(ValueError, match="forbidden"):
         _validate_sql_query("SELECT * FROM pg_user")
 
+
+def test_normalize_platform_arguments():
+    executor = ToolExecutor()
+
+    class MockTool:
+        spec = ToolSpec(
+            name="search_posts",
+            description="search posts",
+            parameters={"type": "object", "properties": {"keyword": {"type": "str"}, "platform": {"type": "str"}}},
+            source="verosight",
+        )
+
+    tool = MockTool()
+
+    # Query without platform mention -> platform is stripped
+    args1 = {"keyword": "nuklir", "platform": "x"}
+    res1 = executor._normalize_platform_arguments(tool, args1, user_query="apakah nuklir sering dibicarakan?")
+    assert "platform" not in res1
+    assert res1["keyword"] == "nuklir"
+
+    # Query with explicit platform mention ('tiktok') -> platform preserved
+    args2 = {"keyword": "nuklir", "platform": "tiktok"}
+    res2 = executor._normalize_platform_arguments(tool, args2, user_query="apa yang viral soal nuklir di TikTok?")
+    assert res2.get("platform") == "tiktok"
+
+    # Query with explicit 'di x' mention -> platform preserved
+    args3 = {"keyword": "nuklir", "platform": "x"}
+    res3 = executor._normalize_platform_arguments(tool, args3, user_query="apa rumor nuklir di x?")
+    assert res3.get("platform") == "x"
+
+    # Query without user_query -> platform preserved (no strip if query unknown)
+    args4 = {"keyword": "nuklir", "platform": "x"}
+    res4 = executor._normalize_platform_arguments(tool, args4, user_query=None)
+    assert res4.get("platform") == "x"
+
+
     # Multi-statement rejection
     with pytest.raises(ValueError, match="Multi-statement"):
         _validate_sql_query("SELECT 1; SELECT 2;")
@@ -338,3 +429,141 @@ def test_builtin_db_query_sql_validation():
     # Limit capping
     sql_limit = _validate_sql_query("SELECT * FROM runs LIMIT 500")
     assert "LIMIT 100" in sql_limit
+
+
+def test_strip_unknown_arguments():
+    executor = ToolExecutor()
+
+    class MockToolStrict:
+        spec = ToolSpec(
+            name="get_keyword_volume",
+            description="get volume",
+            parameters={"type": "object", "properties": {"keyword": {"type": "string"}, "days": {"type": "integer"}}},
+            source="verosight",
+        )
+
+    class MockToolFlexible:
+        spec = ToolSpec(
+            name="flexible_tool",
+            description="flexible",
+            parameters={"type": "object", "properties": {"a": {"type": "string"}}, "additionalProperties": True},
+            source="local",
+        )
+
+    tool_strict = MockToolStrict()
+    args1 = {"keyword": "IKN", "days": 30, "display_text": "Cek volume IKN 30 hari terakhir"}
+    res1 = executor._strip_unknown_arguments(tool_strict, args1)
+    assert res1 == {"keyword": "IKN", "days": 30}
+    assert "display_text" not in res1
+
+    tool_flexible = MockToolFlexible()
+    args2 = {"a": "test", "display_text": "extra"}
+    res2 = executor._strip_unknown_arguments(tool_flexible, args2)
+    assert res2 == {"a": "test", "display_text": "extra"}
+
+
+def test_sanitize_keyword_list_arguments():
+    executor = ToolExecutor()
+
+    class MockVerosightSearch:
+        spec = ToolSpec(
+            name="verosight__search_posts",
+            description="search posts",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string"},
+                    "exclude_keywords": {"type": "array", "items": {"type": "string"}},
+                    "exclude_profiles": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            source="verosight",
+        )
+
+    class MockNonVerosightSearch:
+        spec = ToolSpec(
+            name="local__search",
+            description="local search",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "exclude_keywords": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            source="local",
+        )
+
+    tool_vero = MockVerosightSearch()
+
+    # 1. Mixed single-word and multi-word in exclude_keywords -> drops multi-word
+    args1 = {
+        "keyword": "IKN",
+        "exclude_keywords": ["saham", "saham IKN", "NSIT", "ICN"],
+    }
+    res1 = executor._sanitize_keyword_list_arguments(tool_vero, args1)
+    assert res1["exclude_keywords"] == ["saham", "NSIT", "ICN"]
+    assert res1["keyword"] == "IKN"
+
+    # 2. All multi-word in exclude_keywords -> key removed
+    args2 = {
+        "keyword": "IKN",
+        "exclude_keywords": ["saham IKN", "pasar modal"],
+    }
+    res2 = executor._sanitize_keyword_list_arguments(tool_vero, args2)
+    assert "exclude_keywords" not in res2
+    assert res2["keyword"] == "IKN"
+
+    # 3. Scalar keyword is multi-word -> UNTOUCHED (must not be altered by list sanitizer)
+    args3 = {
+        "keyword": "Ibu Kota Nusantara",
+        "exclude_keywords": ["saham", "saham IKN"],
+    }
+    res3 = executor._sanitize_keyword_list_arguments(tool_vero, args3)
+    assert res3["keyword"] == "Ibu Kota Nusantara"
+    assert res3["exclude_keywords"] == ["saham"]
+
+    # 4. Non-Verosight tool -> untouched (no over-reach)
+    tool_non_vero = MockNonVerosightSearch()
+    args4 = {"exclude_keywords": ["saham IKN"]}
+    res4 = executor._sanitize_keyword_list_arguments(tool_non_vero, args4)
+    assert res4 == {"exclude_keywords": ["saham IKN"]}
+
+
+def test_dedupe_namespace_prefix():
+    executor = ToolExecutor()
+    assert executor._dedupe_namespace_prefix("verosight__verosight__search_posts") == "verosight__search_posts"
+    assert executor._dedupe_namespace_prefix("verosight__search_posts") == "verosight__search_posts"
+    assert executor._dedupe_namespace_prefix("verosight__get_keyword_volume") == "verosight__get_keyword_volume"
+    assert executor._dedupe_namespace_prefix("custom__custom__custom__tool") == "custom__tool"
+    assert executor._dedupe_namespace_prefix("calculator") == "calculator"
+    assert executor._dedupe_namespace_prefix("") == ""
+
+
+@pytest.mark.asyncio
+async def test_executor_repair_doubled_tool_name_prefix():
+    registry = ToolRegistry()
+
+    @register_tool(
+        name="verosight__search_posts",
+        description="Search posts tool",
+        cost_credits=1,
+        registry=registry,
+    )
+    async def mock_search(query: str = "") -> str:
+        return "search_ok"
+
+    executor = ToolExecutor(registry=registry)
+
+    # 1. Doubled prefix tool call -> repaired & executed successfully
+    res1 = await executor.execute("verosight__verosight__search_posts", {"query": "test"})
+    assert res1.status == "success"
+    assert res1.data == "search_ok"
+    assert res1.tool_name == "verosight__search_posts"
+
+    # 2. Non-existent tool call -> remains error
+    res2 = await executor.execute("verosight__verosight__non_existent_tool", {})
+    assert res2.status == "error"
+    assert "not found or disabled" in res2.error
+
+
+

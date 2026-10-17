@@ -197,6 +197,97 @@ async def test_identical_tool_calls_detected_cache_and_no_progress() -> None:
     assert result.status in ("success", "exhausted")
 
 
+@pytest.mark.asyncio
+async def test_empty_llm_response_returns_terminal_status() -> None:
+    """Verify that an empty LLM response (no tool calls, no text) produces a terminal status, never 'running'."""
+    empty_resp = LLMResponse(
+        response_id="resp-empty",
+        output_text=None,
+        function_calls=[],
+        status="completed",
+        incomplete_reason=None,
+        usage=UsageInfo(0, 0),
+        raw={},
+    )
+    llm = DeterministicLLMClient([empty_resp])
+    loop = AgentLoop(llm_client=llm)
+
+    result = await loop.run("Tes query dengan LLM kosong")
+    assert result.status in ("success", "exhausted", "failed")
+    assert result.status != "running"
+    assert result.answer != ""
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_forces_store_false() -> None:
+    """Verify that chat_completions api_style overrides store option to False."""
+    text_resp = _make_text_response("Hasil tes")
+    llm = DeterministicLLMClient([text_resp])
+    llm._api_style = "chat_completions"
+
+    loop = AgentLoop(llm_client=llm)
+    opts = RunOptions(store=True)
+    result = await loop.run("Query tes", options=opts)
+
+    assert result.status == "success"
+    assert loop.last_state is not None
+
+
+@pytest.mark.asyncio
+async def test_fallback_synthesizes_existing_execution_memory() -> None:
+    """Verify that when synthesis returns empty response, fallback finalizer uses memory data."""
+    # Step 1: LLM requests dummy_search tool
+    tool_resp = _make_tool_call_response("dummy_search", {"query": "perang"})
+    # Step 2: Synthesis LLM returns empty response
+    empty_synthesis_resp = LLMResponse(
+        response_id="resp-empty-synth",
+        output_text=None,
+        function_calls=[],
+        status="completed",
+        incomplete_reason=None,
+        usage=UsageInfo(0, 0),
+        raw={},
+    )
+    # Step 3: Fallback LLM returns final answer based on fallback prompt
+    fallback_resp = _make_text_response("Berdasarkan data perang: 78 post ditemukan pada 2026-07-04.")
+
+    llm = DeterministicLLMClient([tool_resp, empty_synthesis_resp, fallback_resp])
+
+    # Register dummy tool
+    reg = get_registry()
+
+    class DummySearchTool(BaseTool):
+        spec = ToolSpec(
+            name="dummy_search",
+            description="Dummy search tool",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}},
+            source="local",
+        )
+
+        async def run(self, **kwargs: Any) -> ToolResult:
+            return ToolResult(
+                tool_name="dummy_search",
+                status="success",
+                data={"total_posts": 78, "date": "2026-07-04"},
+                duration_ms=50,
+            )
+
+    dummy_tool = DummySearchTool()
+    reg.register(dummy_tool)
+
+    try:
+        loop = AgentLoop(llm_client=llm, registry=reg)
+        result = await loop.run("Apakah topik perang sering dibicarakan?")
+
+        assert result.status in ("success", "exhausted")
+        assert result.status != "running"
+        assert "78" in result.answer or "perang" in result.answer
+        assert "tidak ada data" not in result.answer.lower()
+    finally:
+        reg.unregister("dummy_search")
+
+
+
 # ============================================================================
 # Live End-to-End Tests (Marker `live`)
 # ============================================================================

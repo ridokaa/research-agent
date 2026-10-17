@@ -15,33 +15,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 def build_function_tool(spec: dict[str, Any]) -> dict[str, Any]:
-    """Convert a tool spec to the flat format required by the Responses API.
-
-    Responses API tool format (FLAT)::
-
-        {
-            "type": "function",
-            "name": "my_tool",
-            "description": "...",
-            "parameters": { ...JSON Schema... }
-        }
-
-    This is intentionally different from chat/completions, which uses::
-
-        {
-            "type": "function",
-            "function": {          # ← this nested key does NOT exist in Responses API
-                "name": "...",
-                ...
-            }
-        }
-
-    Parameters
-    ----------
-    spec:
-        Dict with at minimum ``name`` and optionally ``description``,
-        ``parameters``.  A ``type`` key is added / overridden to ``"function"``.
-    """
+    """Convert a tool spec to the flat format required by the Responses API."""
     tool: dict[str, Any] = {
         "type": "function",
         "name": spec["name"],
@@ -50,29 +24,181 @@ def build_function_tool(spec: dict[str, Any]) -> dict[str, Any]:
         tool["description"] = spec["description"]
     if "parameters" in spec:
         tool["parameters"] = spec["parameters"]
-    # Extra keys (e.g. strict) are forwarded as-is
     for k, v in spec.items():
         if k not in ("type", "name", "description", "parameters"):
             tool[k] = v
     return tool
 
 
-def to_function_call_output(call_id: str, result_text: str) -> dict[str, Any]:
-    """Build a function_call_output input item for the next Responses API call.
+def build_chat_tool(spec: dict[str, Any]) -> dict[str, Any]:
+    """Convert a tool spec to the nested format required by Chat Completions API.
 
-    When returning a tool result in a follow-up request use this format::
+    Format::
 
         {
-            "type": "function_call_output",
-            "call_id": "<call_id from the model>",
-            "output": "<serialised result as string>"
+            "type": "function",
+            "function": {
+                "name": "my_tool",
+                "description": "...",
+                "parameters": { ...JSON Schema... }
+            }
         }
     """
+    fn: dict[str, Any] = {"name": spec["name"]}
+    if "description" in spec:
+        fn["description"] = spec["description"]
+    if "parameters" in spec:
+        fn["parameters"] = spec["parameters"]
+    for k, v in spec.items():
+        if k not in ("type", "name", "description", "parameters", "function"):
+            fn[k] = v
+    return {"type": "function", "function": fn}
+
+
+def to_function_call_output(call_id: str, result_text: str) -> dict[str, Any]:
+    """Build a function_call_output input item for the Responses API."""
     return {
         "type": "function_call_output",
         "call_id": call_id,
         "output": result_text,
     }
+
+
+def to_chat_tool_output(call_id: str, result_text: str) -> dict[str, Any]:
+    """Build a tool result message item for Chat Completions API."""
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": result_text,
+    }
+
+
+def to_chat_messages(
+    input_data: str | list[Any],
+    instructions: str | None = None,
+) -> list[dict[str, Any]]:
+    """Convert neutral input / instructions into OpenAI Chat Completions messages list format."""
+    messages: list[dict[str, Any]] = []
+
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+
+    if isinstance(input_data, str):
+        if input_data.strip():
+            messages.append({"role": "user", "content": input_data})
+        return messages
+
+    if isinstance(input_data, list):
+        converted: list[dict[str, Any]] = []
+        for item in input_data:
+            if hasattr(item, "model_dump"):
+                converted.append(item.model_dump(exclude_none=True))
+            elif isinstance(item, dict):
+                converted.append(item)
+            elif hasattr(item, "__dict__"):
+                converted.append(dict(item.__dict__))
+        input_data = converted
+
+    for item in input_data:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        item_role = item.get("role")
+
+        if item_type == "function_call_output" or item_role == "tool":
+            call_id = item.get("call_id") or item.get("tool_call_id", "")
+            output_content = item.get("output") if "output" in item else item.get("content", "")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": str(call_id),
+                "content": str(output_content) if output_content is not None else "",
+            })
+        elif item_type == "message" or item_role in ("user", "assistant", "system"):
+            role = item_role or item.get("role", "user")
+            msg_dict: dict[str, Any] = {"role": role}
+
+            content = item.get("content")
+            if content is not None:
+                msg_dict["content"] = str(content)
+            else:
+                msg_dict["content"] = None
+
+            raw_tc = item.get("tool_calls")
+            if raw_tc:
+                tool_calls = []
+                for tc in raw_tc:
+                    if isinstance(tc, dict) and "id" in tc and "function" in tc:
+                        tool_calls.append(tc)
+                    elif isinstance(tc, dict):
+                        tc_id = tc.get("id") or tc.get("call_id", "")
+                        tc_name = tc.get("name") or (tc.get("function", {}).get("name", "") if isinstance(tc.get("function"), dict) else "")
+                        tc_args = tc.get("arguments") if "arguments" in tc else tc.get("arguments_dict")
+                        if tc_args is None and isinstance(tc.get("function"), dict):
+                            tc_args = tc.get("function", {}).get("arguments", {})
+                        args_str = json.dumps(tc_args) if isinstance(tc_args, dict) else str(tc_args or "{}")
+                        tool_calls.append({
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {"name": tc_name, "arguments": args_str},
+                        })
+                    elif hasattr(tc, "id") or hasattr(tc, "call_id"):
+                        tc_id = getattr(tc, "id", getattr(tc, "call_id", ""))
+                        tc_name = getattr(tc, "name", "")
+                        tc_args = getattr(tc, "arguments", getattr(tc, "arguments_dict", {}))
+                        args_str = json.dumps(tc_args) if isinstance(tc_args, dict) else str(tc_args)
+                        tool_calls.append({
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {"name": tc_name, "arguments": args_str},
+                        })
+                msg_dict["tool_calls"] = tool_calls
+            elif "function_calls" in item and item["function_calls"]:
+                tool_calls = []
+                for fc in item["function_calls"]:
+                    fc_name = fc.get("name", "") if isinstance(fc, dict) else getattr(fc, "name", "")
+                    fc_id = fc.get("call_id", "") if isinstance(fc, dict) else getattr(fc, "call_id", "")
+                    fc_args = fc.get("arguments_dict", {}) if isinstance(fc, dict) else getattr(fc, "arguments_dict", {})
+                    args_str = json.dumps(fc_args) if isinstance(fc_args, dict) else str(fc_args)
+                    tool_calls.append({
+                        "id": fc_id,
+                        "type": "function",
+                        "function": {"name": fc_name, "arguments": args_str},
+                    })
+                msg_dict["tool_calls"] = tool_calls
+
+            messages.append(msg_dict)
+        elif item_type == "function_call":
+            # Assistant tool call request
+            call_id = item.get("call_id", "")
+            name = item.get("name", "")
+            raw_args = item.get("arguments", "{}")
+            args_str = json.dumps(raw_args) if isinstance(raw_args, dict) else str(raw_args)
+            tc_dict = {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": args_str},
+            }
+            if (
+                messages
+                and messages[-1].get("role") == "assistant"
+                and "tool_calls" in messages[-1]
+                and isinstance(messages[-1]["tool_calls"], list)
+            ):
+                messages[-1]["tool_calls"].append(tc_dict)
+            else:
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [tc_dict],
+                })
+        elif "content" in item and "role" in item:
+            messages.append({
+                "role": item["role"],
+                "content": str(item["content"]) if item["content"] is not None else None,
+            })
+
+    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +207,7 @@ def to_function_call_output(call_id: str, result_text: str) -> dict[str, Any]:
 
 @dataclass
 class UsageInfo:
-    """Token usage from a Responses API response."""
+    """Token usage from a Responses or Chat Completions API response."""
 
     input_tokens: int = 0
     output_tokens: int = 0
@@ -94,10 +220,9 @@ class UsageInfo:
     def from_raw(cls, raw: dict[str, Any] | None) -> UsageInfo:
         if raw is None:
             return cls()
-        return cls(
-            input_tokens=raw.get("input_tokens", 0),
-            output_tokens=raw.get("output_tokens", 0),
-        )
+        inp = raw.get("input_tokens", raw.get("prompt_tokens", 0))
+        out = raw.get("output_tokens", raw.get("completion_tokens", 0))
+        return cls(input_tokens=inp, output_tokens=out)
 
 
 @dataclass
@@ -123,14 +248,35 @@ class FunctionCall:
             arguments_dict=args,
         )
 
+    @classmethod
+    def from_chat_tool_call(cls, tool_call: dict[str, Any]) -> FunctionCall:
+        """Parse a tool_call item from a Chat Completions choice message."""
+        call_id = tool_call.get("id", "")
+        fn = tool_call.get("function", {})
+        name = fn.get("name", "")
+        raw_args = fn.get("arguments", "{}")
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except (json.JSONDecodeError, TypeError):
+            args = {"_raw": raw_args}
+        return cls(call_id=call_id, name=name, arguments_dict=args)
+
     def to_output_item(self, result_text: str) -> dict[str, Any]:
         """Convenience wrapper: produce the function_call_output input item."""
         return to_function_call_output(self.call_id, result_text)
 
+    @property
+    def id(self) -> str:
+        return self.call_id
+
+    @property
+    def arguments(self) -> dict[str, Any]:
+        return self.arguments_dict
+
 
 @dataclass
 class LLMResponse:
-    """Parsed response from the OpenAI Responses API."""
+    """Parsed response from OpenAI (Responses API or Chat Completions API)."""
 
     response_id: str
     output_text: str | None
@@ -140,13 +286,24 @@ class LLMResponse:
     usage: UsageInfo
     raw: dict[str, Any]
 
+    @property
+    def tool_calls(self) -> list[FunctionCall]:
+        return self.function_calls
+
+    @property
+    def content(self) -> str | None:
+        return self.output_text
+
     # ------------------------------------------------------------------
-    # Factory
+    # Factories
     # ------------------------------------------------------------------
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> LLMResponse:
-        """Parse a full Responses API JSON response body."""
+        """Parse a full Responses API or Chat Completions API JSON response body."""
+        if "choices" in raw:
+            return cls.from_chat_raw(raw)
+
         response_id = raw.get("id", "")
         status = raw.get("status", "completed")
         incomplete_reason = raw.get("incomplete_details", {}).get("reason") if raw.get("incomplete_details") else None
@@ -168,6 +325,50 @@ class LLMResponse:
                 function_calls.append(FunctionCall.from_output_item(item))
 
         output_text = "\n".join(output_texts) if output_texts else None
+
+        return cls(
+            response_id=response_id,
+            output_text=output_text,
+            function_calls=function_calls,
+            status=status,
+            incomplete_reason=incomplete_reason,
+            usage=usage,
+            raw=raw,
+        )
+
+    @classmethod
+    def from_chat_raw(cls, raw: dict[str, Any]) -> LLMResponse:
+        """Parse a Chat Completions API JSON response body (choices[0].message)."""
+        response_id = raw.get("id", "")
+        usage = UsageInfo.from_raw(raw.get("usage"))
+        choices = raw.get("choices", [])
+        if not choices:
+            return cls(
+                response_id=response_id,
+                output_text=None,
+                function_calls=[],
+                status="completed",
+                incomplete_reason=None,
+                usage=usage,
+                raw=raw,
+            )
+
+        first_choice = choices[0]
+        finish_reason = first_choice.get("finish_reason", "stop")
+        msg = first_choice.get("message", {})
+
+        output_text = msg.get("content")
+        if output_text is not None and not str(output_text).strip():
+            output_text = None
+
+        function_calls: list[FunctionCall] = []
+        raw_tool_calls = msg.get("tool_calls", [])
+        if raw_tool_calls:
+            for tc in raw_tool_calls:
+                function_calls.append(FunctionCall.from_chat_tool_call(tc))
+
+        status = "completed" if finish_reason in ("stop", "tool_calls") else finish_reason
+        incomplete_reason = finish_reason if finish_reason not in ("stop", "tool_calls") else None
 
         return cls(
             response_id=response_id,
@@ -211,7 +412,25 @@ def compact_input(
     if len(items) <= keep_last_n:
         return list(items)
 
-    trimmed = list(items[-keep_last_n:])
+    start_idx = len(items) - keep_last_n
+    call_ids_in_trimmed = {
+        it.get("call_id") for it in items[start_idx:] if isinstance(it, dict) and it.get("type") == "function_call"
+    }
+    while start_idx > 0:
+        first_item = items[start_idx]
+        if isinstance(first_item, dict):
+            is_output = first_item.get("type") == "function_call_output" or first_item.get("role") == "tool"
+            if is_output:
+                output_call_id = first_item.get("call_id") or first_item.get("tool_call_id")
+                if output_call_id and output_call_id not in call_ids_in_trimmed:
+                    start_idx -= 1
+                    prev_item = items[start_idx]
+                    if isinstance(prev_item, dict) and prev_item.get("type") == "function_call":
+                        call_ids_in_trimmed.add(prev_item.get("call_id"))
+                    continue
+        break
+
+    trimmed = list(items[start_idx:])
 
     if summary:
         summary_item: dict[str, Any] = {

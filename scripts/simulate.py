@@ -18,6 +18,7 @@ from app.agent.loop import AgentLoop
 from app.config import get_settings
 from app.db.session import close_engine, get_session, init_engine
 from app.schemas.agent import RunOptions
+from app.tools.registry import init_registry
 from scripts.seed_scenarios import ALL_SCENARIOS, run_all_scenarios
 
 app = typer.Typer(help="Agentic Loop local simulation CLI.")
@@ -34,6 +35,14 @@ def scenarios(
     console.print("[bold blue]Executing Agentic Loop Simulation Scenarios...[/bold blue]\n")
 
     async def _runner():
+        init_registry()
+        settings = get_settings()
+        if settings.VEROSIGHT_ENABLED and settings.VEROSIGHT_MODE in ("mcp", "both"):
+            try:
+                from app.mcp.manager import get_mcp_manager
+                await get_mcp_manager().connect_all()
+            except Exception as exc:
+                console.print(f"[bold yellow]MCP Connection warning:[/bold yellow] {exc}")
         results = await run_all_scenarios()
 
         if as_json:
@@ -92,6 +101,14 @@ def ask(
     console.print(Panel(f"[bold yellow]User Query:[/bold yellow] {query}", title="Agentic Loop Simulation"))
 
     async def _run_query():
+        init_registry()
+        settings = get_settings()
+        if settings.VEROSIGHT_ENABLED and settings.VEROSIGHT_MODE in ("mcp", "both"):
+            try:
+                from app.mcp.manager import get_mcp_manager
+                await get_mcp_manager().connect_all()
+            except Exception as exc:
+                console.print(f"[bold yellow]MCP Connection warning:[/bold yellow] {exc}")
         loop = AgentLoop()
         opts = RunOptions(max_iterations=max_iter, credits_budget=credits_budget)
         res = await loop.run(query, options=opts)
@@ -100,13 +117,15 @@ def ask(
         if tracer and hasattr(tracer, "_buffer"):
             console.print("\n[bold cyan]--- Real-time Run Trace Events ---[/bold cyan]")
             for ev in tracer._buffer:
-                tag = f"[{ev.event_type.upper()}]"
-                color = "green" if "start" in ev.event_type or "end" in ev.event_type else "cyan"
-                if "error" in ev.event_type:
+                ev_type = getattr(ev, "type", getattr(ev, "event_type", ""))
+                tag = f"[{str(ev_type).upper()}]"
+                color = "green" if "start" in str(ev_type) or "end" in str(ev_type) else "cyan"
+                if "error" in str(ev_type):
                     color = "red"
-                elif "tool" in ev.event_type:
+                elif "tool" in str(ev_type):
                     color = "yellow"
-                console.print(f"  [bold {color}]{tag:<16}[/bold {color}] {ev.message}")
+                msg = getattr(ev, "summary", str(getattr(ev, "payload", "")))
+                console.print(f"  [bold {color}]{tag:<16}[/bold {color}] {msg}")
 
         console.print("\n" + "=" * 80)
         console.print(Panel(f"[bold green]Final Answer:[/bold green]\n{res.answer}", title=f"Result (Status: {res.status})"))
