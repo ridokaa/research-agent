@@ -50,8 +50,8 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "https://api.openai.com/v1"
     LLM_API_KEY: str = "sk-xxx"
     LLM_MODEL: str = "gpt-4o-mini"
-    LLM_TEMPERATURE: float = Field(default=0.2, ge=0.0, le=2.0)
-    LLM_MAX_OUTPUT_TOKENS: int = Field(default=2048, ge=1)
+    LLM_TEMPERATURE: float = Field(default=0.7, ge=0.0, le=2.0)
+    LLM_MAX_OUTPUT_TOKENS: int = Field(default=16000, ge=1)
     LLM_TIMEOUT_S: float = Field(default=60.0, gt=0)
     LLM_STORE: bool = True
     LLM_REASONING_EFFORT: str | None = None
